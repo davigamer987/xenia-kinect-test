@@ -140,6 +140,12 @@ Depth safety and smoothing on the Xenia side can be tuned with:
 --nui_skeleton_torso_baseline_z_m=2.0 --nui_skeleton_min_depth_m=0.8 --nui_skeleton_max_depth_m=4.0 --nui_skeleton_depth_smoothing=0.35
 ```
 
+To reduce tracked/untracked flicker in strict titles:
+
+```bash
+--nui_sensor_tracking_acquire_frames=2 --nui_sensor_tracking_hold_ms=400
+```
+
 If the sender provides normalized camera joints (default RTMPose bridge), keep
 `--nui_skeleton_input_normalized=true` and tune the 3D conversion with:
 

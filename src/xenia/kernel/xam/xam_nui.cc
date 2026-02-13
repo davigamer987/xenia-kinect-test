@@ -68,6 +68,14 @@ DEFINE_int32(nui_sensor_frame_timeout_ms, 500,
 DEFINE_double(nui_sensor_min_joint_confidence, 0.25,
               "Minimum joint confidence that marks a frame as tracked.",
               "Kernel");
+DEFINE_int32(
+    nui_sensor_tracking_acquire_frames, 2,
+    "Consecutive tracked sensor frames required before reporting tracked.",
+    "Kernel");
+DEFINE_int32(
+    nui_sensor_tracking_hold_ms, 400,
+    "How long to hold tracked state after temporary confidence drop.",
+    "Kernel");
 DEFINE_double(
     nui_sensor_source_aspect_ratio, 4.0 / 3.0,
     "Fallback RTMPose sender aspect ratio used by the Kinect debug overlay "
@@ -199,6 +207,7 @@ constexpr size_t kNuiUdpMaxColorPayloadSize = 60000;
 constexpr uint32_t kNuiColorFormatYUY2 = 0x32595559;  // "YUY2"
 constexpr uint32_t kNuiColorFormatRGB3 = 0x33424752;  // "RGB3"
 constexpr uint32_t kNuiColorFormatBGRX = 0x58524742;  // "BGRX"
+constexpr uint32_t kNuiBridgeRevision = 3;
 constexpr float kPi = 3.14159265358979323846f;
 
 struct NuiJoint {
@@ -908,6 +917,16 @@ class NuiUdpSensorService {
   void EnsureRunning() {
     EnsureExternCallHook();
     EnsureDebugOverlayRegistered();
+    bool logged = startup_logged_.exchange(true, std::memory_order_relaxed);
+    if (!logged) {
+      LogNui(
+          "NUI bridge revision={} status_default={} acquire_frames={} hold_ms={} color_default={}({:08X})",
+          kNuiBridgeRevision, uint32_t(std::max(cvars::nui_device_status_value, 0)),
+          uint32_t(std::max(cvars::nui_sensor_tracking_acquire_frames, 0)),
+          uint32_t(std::max(cvars::nui_sensor_tracking_hold_ms, 0)),
+          FourCCToString(uint32_t(std::max(cvars::nui_sensor_color_format_fourcc, 0))),
+          uint32_t(std::max(cvars::nui_sensor_color_format_fourcc, 0)));
+    }
     if (!cvars::nui_sensor_udp_enabled) {
       return;
     }
@@ -1404,7 +1423,8 @@ class NuiUdpSensorService {
         std::min(size_t(joint_count), kNuiMaxJoints);
     std::array<NuiJoint, kNuiMaxJoints> joints = {};
 
-    bool tracked = tracked_flag != 0;
+    bool tracked_raw = tracked_flag != 0;
+    uint32_t confident_joint_count = 0;
     const float depth_smoothing =
         std::clamp(float(cvars::nui_skeleton_depth_smoothing), 0.0f, 1.0f);
     for (size_t i = 0; i < capped_joint_count; ++i) {
@@ -1424,9 +1444,9 @@ class NuiUdpSensorService {
       smoothed_depths_[i] = joint.z;
       depth_initialized_[i] = true;
       joints[i] = joint;
-      if (!tracked &&
-          joint.confidence >= float(cvars::nui_sensor_min_joint_confidence)) {
-        tracked = true;
+      if (joint.confidence >= float(cvars::nui_sensor_min_joint_confidence)) {
+        ++confident_joint_count;
+        tracked_raw = true;
       }
     }
     const bool previous_tracked = tracked_.load(std::memory_order_relaxed);
@@ -1443,6 +1463,30 @@ class NuiUdpSensorService {
             previous_fps > 0.0f ? previous_fps * 0.9f + instant_fps * 0.1f
                                 : instant_fps;
         receive_fps_.store(smoothed_fps, std::memory_order_relaxed);
+      }
+    }
+
+    if (tracked_raw) {
+      ++consecutive_tracked_frames_;
+      last_tracked_host_us_.store(host_receive_us, std::memory_order_relaxed);
+    } else {
+      consecutive_tracked_frames_ = 0;
+    }
+    const uint32_t acquire_frames =
+        uint32_t(std::max(cvars::nui_sensor_tracking_acquire_frames, 1));
+    const uint64_t hold_us =
+        uint64_t(std::max(cvars::nui_sensor_tracking_hold_ms, 0)) * 1000ull;
+    bool tracked = previous_tracked;
+    if (tracked_raw) {
+      tracked = previous_tracked || (consecutive_tracked_frames_ >= acquire_frames);
+    } else {
+      if (previous_tracked && hold_us > 0) {
+        const uint64_t last_tracked_us =
+            last_tracked_host_us_.load(std::memory_order_relaxed);
+        tracked = last_tracked_us && host_receive_us >= last_tracked_us &&
+                  (host_receive_us - last_tracked_us) <= hold_us;
+      } else {
+        tracked = false;
       }
     }
 
@@ -1486,8 +1530,11 @@ class NuiUdpSensorService {
       const NuiJoint hip_left = capped_joint_count > 11 ? joints[11] : NuiJoint{};
       const NuiJoint hip_right = capped_joint_count > 12 ? joints[12] : NuiJoint{};
       LogNui(
-          "RX frame={} tracked={} joints={} src={}x{} nose=({:.3f},{:.3f},{:.3f}|{:.2f}) hips=({:.3f},{:.3f})/({:.3f},{:.3f})",
-          frame_index, tracked ? "yes" : "no", uint32_t(capped_joint_count),
+          "RX frame={} tracked={} raw={} conf={} acquire={} hold_ms={} joints={} src={}x{} nose=({:.3f},{:.3f},{:.3f}|{:.2f}) hips=({:.3f},{:.3f})/({:.3f},{:.3f})",
+          frame_index, tracked ? "yes" : "no", tracked_raw ? "yes" : "no",
+          confident_joint_count, acquire_frames,
+          uint32_t(std::max(cvars::nui_sensor_tracking_hold_ms, 0)),
+          uint32_t(capped_joint_count),
           uint32_t(frame_width), uint32_t(frame_height), nose.x, nose.y, nose.z,
           nose.confidence, hip_left.x, hip_left.y, hip_right.x, hip_right.y);
       if (has_color_extension) {
@@ -1501,14 +1548,17 @@ class NuiUdpSensorService {
   std::thread worker_;
   std::atomic<bool> started_ = false;
   std::atomic<bool> stop_requested_ = false;
+  std::atomic<bool> startup_logged_ = false;
   std::atomic<bool> debug_overlay_registered_ = false;
   std::atomic<bool> tracked_ = false;
   std::atomic<uint32_t> last_frame_index_ = 0;
   std::atomic<uint64_t> last_sensor_timestamp_us_ = 0;
   std::atomic<uint64_t> last_frame_host_us_ = 0;
+  std::atomic<uint64_t> last_tracked_host_us_ = 0;
   std::atomic<uint16_t> last_frame_width_ = 0;
   std::atomic<uint16_t> last_frame_height_ = 0;
   std::atomic<float> receive_fps_ = 0.0f;
+  uint32_t consecutive_tracked_frames_ = 0;
   mutable std::mutex frame_mutex_;
   uint16_t latest_joint_count_ = 0;
   std::array<NuiJoint, kNuiMaxJoints> latest_joints_ = {};
@@ -1732,7 +1782,7 @@ dword_result_t XamNuiGetDeviceStatus_entry(
   const bool connected = IsNuiDeviceConnected();
   const bool tracked = IsNuiSkeletonTracked();
   const uint32_t status_value =
-      connected ? uint32_t(std::max(cvars::nui_device_status_value, 1)) : 0u;
+      connected ? uint32_t(std::max(cvars::nui_device_status_value, 2)) : 0u;
   status_ptr.Zero();
   status_ptr->unk0 = status_value;
   status_ptr->unk1 = connected ? 1u : 0u;
