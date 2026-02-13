@@ -26,7 +26,44 @@ jobs:
 
       - name: Build xenia-app (Checked)
         shell: pwsh
-        run: py -3 .\xenia-build build --config checked -j $env:NUMBER_OF_PROCESSORS -- /v:detailed /bl:msbuild.binlog
+        run: |
+          $buildArgs = @(
+            '.\xenia-build',
+            'build',
+            '--config', 'checked',
+            '-j', $env:NUMBER_OF_PROCESSORS,
+            '--',
+            '/v:minimal',
+            '/clp:ErrorsOnly;Summary',
+            '/bl:msbuild.binlog'
+          )
+
+          & py -3 @buildArgs 2>&1 | Tee-Object -FilePath xenia-build.log
+          $exitCode = $LASTEXITCODE
+
+          if ($exitCode -ne 0) {
+            Write-Host "=== Extracted error lines ==="
+            $errors = Select-String `
+              -Path xenia-build.log `
+              -Pattern 'error MSB|fatal error|: error [A-Z]*[0-9]+' `
+              -CaseSensitive:$false
+            if ($errors) {
+              $errors | Select-Object -First 200 | ForEach-Object { $_.Line }
+            } else {
+              Write-Host "No explicit error lines were matched; inspect msbuild.binlog."
+            }
+          }
+
+          exit $exitCode
+
+      - name: Upload Build Log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenia-windows-build-log
+          path: xenia-build.log
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload MSBuild binlog
         if: always()
