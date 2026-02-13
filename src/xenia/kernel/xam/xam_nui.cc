@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -23,6 +24,7 @@
 #include <vector>
 
 #include "third_party/imgui/imgui.h"
+#include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
 #include "xenia/emulator.h"
@@ -80,6 +82,10 @@ DEFINE_bool(
     log_kinect_nui_calls, true,
     "Write Kinect/NUI bridge call details to xenia.log.",
     "Kernel");
+DEFINE_path(
+    nui_sensor_log_path, "",
+    "Optional host path for a dedicated Kinect/NUI call log file.",
+    "Kernel");
 DEFINE_int32(
     nui_sensor_log_frame_interval, 30,
     "How often to log received UDP skeleton frames (in frame count).",
@@ -104,6 +110,19 @@ DEFINE_double(
 DEFINE_double(
     nui_skeleton_depth_smoothing, 0.35,
     "Depth smoothing factor for incoming Kinect joints (0=no smoothing, 1=no history).",
+    "Kernel");
+DEFINE_bool(
+    nui_skeleton_input_normalized, true,
+    "Interpret incoming UDP joint x/y as normalized camera coordinates in "
+    "[-1, 1] and convert them to Kinect-like meters.",
+    "Kernel");
+DEFINE_double(
+    nui_skeleton_camera_fov_x_deg, 57.0,
+    "Horizontal FOV used to convert normalized joint x into meters.",
+    "Kernel");
+DEFINE_double(
+    nui_skeleton_camera_fov_y_deg, 43.0,
+    "Vertical FOV used to convert normalized joint y into meters.",
     "Kernel");
 
 namespace xe {
@@ -130,6 +149,7 @@ constexpr size_t kNuiUdpHeaderSize = 24;
 constexpr size_t kNuiUdpJointSize = 16;
 constexpr size_t kNuiMaxJoints = 32;
 constexpr size_t kNuiUdpFrameSizeTailSize = 4;
+constexpr float kPi = 3.14159265358979323846f;
 
 struct NuiJoint {
   float x = 0.0f;
@@ -231,6 +251,58 @@ struct NuiJointSample {
 std::mutex g_nui_log_mutex;
 std::deque<std::string> g_nui_log_lines;
 std::atomic<uint64_t> g_nui_log_line_index = 0;
+std::mutex g_nui_log_file_mutex;
+std::filesystem::path g_nui_log_file_path;
+FILE* g_nui_log_file = nullptr;
+bool g_nui_log_file_open_failed = false;
+
+void CloseNuiLogFileLocked() {
+  if (!g_nui_log_file) {
+    return;
+  }
+  std::fflush(g_nui_log_file);
+  std::fclose(g_nui_log_file);
+  g_nui_log_file = nullptr;
+}
+
+void AppendNuiLogFile(const std::string& line) {
+  const std::filesystem::path desired_path = cvars::nui_sensor_log_path;
+  std::lock_guard<std::mutex> lock(g_nui_log_file_mutex);
+
+  if (desired_path.empty()) {
+    CloseNuiLogFileLocked();
+    g_nui_log_file_path.clear();
+    g_nui_log_file_open_failed = false;
+    return;
+  }
+
+  if (desired_path != g_nui_log_file_path || !g_nui_log_file) {
+    CloseNuiLogFileLocked();
+    g_nui_log_file_path = desired_path;
+    g_nui_log_file_open_failed = false;
+
+    xe::filesystem::CreateParentFolder(desired_path);
+    g_nui_log_file = xe::filesystem::OpenFile(desired_path, "at");
+    if (!g_nui_log_file) {
+      if (!g_nui_log_file_open_failed) {
+        XELOGE("NUI: failed to open dedicated log file {}",
+               xe::path_to_utf8(desired_path));
+        g_nui_log_file_open_failed = true;
+      }
+      return;
+    }
+    XELOGI("NUI: writing dedicated call log to {}",
+           xe::path_to_utf8(desired_path));
+  }
+
+  if (!g_nui_log_file) {
+    return;
+  }
+
+  std::fwrite(line.data(), sizeof(char), line.size(), g_nui_log_file);
+  std::fputc('\n', g_nui_log_file);
+  std::fflush(g_nui_log_file);
+}
 
 void AddNuiLogLine(const std::string& message) {
   const uint64_t line_index =
@@ -243,6 +315,7 @@ void AddNuiLogLine(const std::string& message) {
       g_nui_log_lines.pop_front();
     }
   }
+  AppendNuiLogFile(line);
   if (cvars::log_kinect_nui_calls) {
     XELOGI("NUI: {}", message);
   }
@@ -345,6 +418,12 @@ float ClampDepthMeters(float depth_meters) {
   return std::clamp(depth_meters, min_depth, max_depth);
 }
 
+float TanHalfFovRadians(double fov_degrees) {
+  const float clamped = std::clamp(float(fov_degrees), 1.0f, 179.0f);
+  const float radians = clamped * (kPi / 180.0f);
+  return std::tan(radians * 0.5f);
+}
+
 void SetVector(X_NUI_VECTOR4* vector, float x, float y, float z, float w) {
   assert_not_null(vector);
   vector->x = x;
@@ -385,7 +464,7 @@ void FillJoint(X_NUI_SKELETON_DATA* skeleton, NuiSkeletonPositionIndex index,
   SetVector(&skeleton->joints[index], sample.x, sample.y,
             ClampDepthMeters(sample.z), 1.0f);
   skeleton->joint_states[index] = sample.valid ? kNuiSkeletonPositionTracked
-                                               : kNuiSkeletonPositionNotTracked;
+                                               : kNuiSkeletonPositionInferred;
 }
 
 void BuildSkeletonFrame(const NuiDebugSnapshot& snapshot,
@@ -452,9 +531,36 @@ void BuildSkeletonFrame(const NuiDebugSnapshot& snapshot,
   const NuiJointSample ankle_right =
       GetCocoJoint(snapshot, kCocoRightAnkle, confidence_threshold);
 
+  const bool input_normalized = cvars::nui_skeleton_input_normalized;
+  const float tan_half_fov_x = TanHalfFovRadians(cvars::nui_skeleton_camera_fov_x_deg);
+  const float tan_half_fov_y = TanHalfFovRadians(cvars::nui_skeleton_camera_fov_y_deg);
+  auto to_skeleton_space = [input_normalized, tan_half_fov_x, tan_half_fov_y](
+                               NuiJointSample sample) -> NuiJointSample {
+    sample.z = ClampDepthMeters(sample.z);
+    if (input_normalized) {
+      sample.x = sample.x * sample.z * tan_half_fov_x;
+      sample.y = sample.y * sample.z * tan_half_fov_y;
+    }
+    return sample;
+  };
+
+  const NuiJointSample head_s = to_skeleton_space(head);
+  const NuiJointSample shoulder_left_s = to_skeleton_space(shoulder_left);
+  const NuiJointSample shoulder_right_s = to_skeleton_space(shoulder_right);
+  const NuiJointSample elbow_left_s = to_skeleton_space(elbow_left);
+  const NuiJointSample elbow_right_s = to_skeleton_space(elbow_right);
+  const NuiJointSample wrist_left_s = to_skeleton_space(wrist_left);
+  const NuiJointSample wrist_right_s = to_skeleton_space(wrist_right);
+  const NuiJointSample hip_left_s = to_skeleton_space(hip_left);
+  const NuiJointSample hip_right_s = to_skeleton_space(hip_right);
+  const NuiJointSample knee_left_s = to_skeleton_space(knee_left);
+  const NuiJointSample knee_right_s = to_skeleton_space(knee_right);
+  const NuiJointSample ankle_left_s = to_skeleton_space(ankle_left);
+  const NuiJointSample ankle_right_s = to_skeleton_space(ankle_right);
+
   const NuiJointSample shoulder_center =
-      AverageJoints(shoulder_left, shoulder_right);
-  const NuiJointSample hip_center = AverageJoints(hip_left, hip_right);
+      AverageJoints(shoulder_left_s, shoulder_right_s);
+  const NuiJointSample hip_center = AverageJoints(hip_left_s, hip_right_s);
   const NuiJointSample spine = AverageJoints(hip_center, shoulder_center);
 
   NuiJointSample safe_hip_center = hip_center;
@@ -465,35 +571,35 @@ void BuildSkeletonFrame(const NuiDebugSnapshot& snapshot,
         ClampDepthMeters(float(cvars::nui_skeleton_torso_baseline_z_m));
     safe_hip_center.valid = true;
   }
-  NuiJointSample safe_head = head;
+  NuiJointSample safe_head = head_s;
   if (!safe_head.valid) {
     safe_head.x = safe_hip_center.x;
     safe_head.y = safe_hip_center.y - 0.35f;
     safe_head.z = safe_hip_center.z - 0.08f;
     safe_head.valid = true;
   }
-  NuiJointSample safe_hip_left = hip_left;
+  NuiJointSample safe_hip_left = hip_left_s;
   if (!safe_hip_left.valid) {
     safe_hip_left.x = safe_hip_center.x - 0.10f;
     safe_hip_left.y = safe_hip_center.y;
     safe_hip_left.z = safe_hip_center.z + 0.05f;
     safe_hip_left.valid = true;
   }
-  NuiJointSample safe_hip_right = hip_right;
+  NuiJointSample safe_hip_right = hip_right_s;
   if (!safe_hip_right.valid) {
     safe_hip_right.x = safe_hip_center.x + 0.10f;
     safe_hip_right.y = safe_hip_center.y;
     safe_hip_right.z = safe_hip_center.z + 0.05f;
     safe_hip_right.valid = true;
   }
-  NuiJointSample safe_hand_left = wrist_left;
+  NuiJointSample safe_hand_left = wrist_left_s;
   if (!safe_hand_left.valid) {
     safe_hand_left.x = safe_hip_center.x - 0.20f;
     safe_hand_left.y = safe_hip_center.y + 0.10f;
     safe_hand_left.z = safe_hip_center.z - 0.25f;
     safe_hand_left.valid = true;
   }
-  NuiJointSample safe_hand_right = wrist_right;
+  NuiJointSample safe_hand_right = wrist_right_s;
   if (!safe_hand_right.valid) {
     safe_hand_right.x = safe_hip_center.x + 0.20f;
     safe_hand_right.y = safe_hip_center.y + 0.10f;
@@ -513,22 +619,22 @@ void BuildSkeletonFrame(const NuiDebugSnapshot& snapshot,
   FillJoint(&skeleton, kNuiSkeletonPositionSpine, spine);
   FillJoint(&skeleton, kNuiSkeletonPositionShoulderCenter, shoulder_center);
   FillJoint(&skeleton, kNuiSkeletonPositionHead, safe_head);
-  FillJoint(&skeleton, kNuiSkeletonPositionShoulderLeft, shoulder_left);
-  FillJoint(&skeleton, kNuiSkeletonPositionElbowLeft, elbow_left);
-  FillJoint(&skeleton, kNuiSkeletonPositionWristLeft, wrist_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionShoulderLeft, shoulder_left_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionElbowLeft, elbow_left_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionWristLeft, wrist_left_s);
   FillJoint(&skeleton, kNuiSkeletonPositionHandLeft, safe_hand_left);
-  FillJoint(&skeleton, kNuiSkeletonPositionShoulderRight, shoulder_right);
-  FillJoint(&skeleton, kNuiSkeletonPositionElbowRight, elbow_right);
-  FillJoint(&skeleton, kNuiSkeletonPositionWristRight, wrist_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionShoulderRight, shoulder_right_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionElbowRight, elbow_right_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionWristRight, wrist_right_s);
   FillJoint(&skeleton, kNuiSkeletonPositionHandRight, safe_hand_right);
   FillJoint(&skeleton, kNuiSkeletonPositionHipLeft, safe_hip_left);
-  FillJoint(&skeleton, kNuiSkeletonPositionKneeLeft, knee_left);
-  FillJoint(&skeleton, kNuiSkeletonPositionAnkleLeft, ankle_left);
-  FillJoint(&skeleton, kNuiSkeletonPositionFootLeft, ankle_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionKneeLeft, knee_left_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionAnkleLeft, ankle_left_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionFootLeft, ankle_left_s);
   FillJoint(&skeleton, kNuiSkeletonPositionHipRight, safe_hip_right);
-  FillJoint(&skeleton, kNuiSkeletonPositionKneeRight, knee_right);
-  FillJoint(&skeleton, kNuiSkeletonPositionAnkleRight, ankle_right);
-  FillJoint(&skeleton, kNuiSkeletonPositionFootRight, ankle_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionKneeRight, knee_right_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionAnkleRight, ankle_right_s);
+  FillJoint(&skeleton, kNuiSkeletonPositionFootRight, ankle_right_s);
   // Keep core joints tracked so retail title gating logic sees a stable body.
   skeleton.joint_states[kNuiSkeletonPositionHead] = kNuiSkeletonPositionTracked;
   skeleton.joint_states[kNuiSkeletonPositionHipCenter] =
@@ -767,10 +873,8 @@ class NuiUdpSensorService {
     auto joint_to_screen = [content_x, content_y, content_width,
                             content_height](const NuiJoint& joint) -> ImVec2 {
       // Sender currently emits normalized camera coordinates in [-1, 1].
-      bool is_unit = joint.x >= 0.0f && joint.x <= 1.0f && joint.y >= 0.0f &&
-                     joint.y <= 1.0f;
-      float x_norm = is_unit ? joint.x : (joint.x * 0.5f + 0.5f);
-      float y_norm = is_unit ? joint.y : (0.5f - joint.y * 0.5f);
+      float x_norm = joint.x * 0.5f + 0.5f;
+      float y_norm = 0.5f - joint.y * 0.5f;
       float x = content_x + x_norm * content_width;
       float y = content_y + y_norm * content_height;
       return ImVec2(x, y);
@@ -1074,33 +1178,55 @@ dword_result_t XamNuiGetDeviceStatus_entry(
 DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kStub);
 
 dword_result_t XamUserNuiGetUserIndex_entry(unknown_t unk, lpdword_t index) {
-  LogNui("XamUserNuiGetUserIndex(unk={:08X}, index_ptr={:08X}) -> no user",
+  if (!index) {
+    AddNuiLogLine("XamUserNuiGetUserIndex(index_ptr=null)");
+    return X_E_INVALIDARG;
+  }
+  if (!IsNuiDeviceConnected() || !IsNuiSkeletonTracked()) {
+    LogNui("XamUserNuiGetUserIndex(unk={:08X}, index_ptr={:08X}) -> no user",
+           uint32_t(unk), index.guest_address());
+    return X_E_NO_SUCH_USER;
+  }
+  *index = 0;
+  LogNui("XamUserNuiGetUserIndex(unk={:08X}, index_ptr={:08X}) -> 0",
          uint32_t(unk), index.guest_address());
-  return X_E_NO_SUCH_USER;
+  return X_E_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndex, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndex, kNone, kImplemented);
 
 dword_result_t XamUserNuiGetUserIndexForSignin_entry(lpdword_t index) {
   if (!index) {
     AddNuiLogLine("XamUserNuiGetUserIndexForSignin(index_ptr=null)");
     return X_E_INVALIDARG;
   }
-  if (kernel_state()->user_profile()->signin_state()) {
+  if (IsNuiDeviceConnected() && IsNuiSkeletonTracked()) {
     *index = 0;
     LogNui("XamUserNuiGetUserIndexForSignin(index_ptr={:08X}) -> 0",
            index.guest_address());
     return X_E_SUCCESS;
   }
-  LogNui("XamUserNuiGetUserIndexForSignin(index_ptr={:08X}) -> denied",
+  LogNui("XamUserNuiGetUserIndexForSignin(index_ptr={:08X}) -> no user",
          index.guest_address());
-  return X_HRESULT_FROM_WIN32(X_ERROR_ACCESS_DENIED);
+  return X_E_NO_SUCH_USER;
 }
 DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndexForSignin, kNone, kImplemented);
 
 dword_result_t XamUserNuiGetUserIndexForBind_entry(lpdword_t index) {
-  return X_E_FAIL;
+  if (!index) {
+    AddNuiLogLine("XamUserNuiGetUserIndexForBind(index_ptr=null)");
+    return X_E_INVALIDARG;
+  }
+  if (!IsNuiDeviceConnected() || !IsNuiSkeletonTracked()) {
+    LogNui("XamUserNuiGetUserIndexForBind(index_ptr={:08X}) -> no user",
+           index.guest_address());
+    return X_E_NO_SUCH_USER;
+  }
+  *index = 0;
+  LogNui("XamUserNuiGetUserIndexForBind(index_ptr={:08X}) -> 0",
+         index.guest_address());
+  return X_E_SUCCESS;
 }
-DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndexForBind, kNone, kStub);
+DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndexForBind, kNone, kImplemented);
 
 dword_result_t XamNuiGetDepthCalibration_entry(lpdword_t unk1) {
   LogNui("XamNuiGetDepthCalibration(ptr={:08X}) -> not found",

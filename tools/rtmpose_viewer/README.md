@@ -86,6 +86,12 @@ For detailed game/NUI call tracing and a dedicated in-emulator log window:
 --show_kinect_nui_log=true --log_kinect_nui_calls=true
 ```
 
+To persist the same NUI/XAM call log to a separate file:
+
+```bash
+--nui_sensor_log_path=/tmp/xenia_nui_calls.log
+```
+
 If a title uses a different argument index for `XamNuiSkeletonScoreUpdate`
 output buffers, adjust:
 
@@ -97,6 +103,13 @@ Depth safety and smoothing on the Xenia side can be tuned with:
 
 ```bash
 --nui_skeleton_torso_baseline_z_m=2.0 --nui_skeleton_min_depth_m=0.8 --nui_skeleton_max_depth_m=4.0 --nui_skeleton_depth_smoothing=0.35
+```
+
+If the sender provides normalized camera joints (default RTMPose bridge), keep
+`--nui_skeleton_input_normalized=true` and tune the 3D conversion with:
+
+```bash
+--nui_skeleton_input_normalized=true --nui_skeleton_camera_fov_x_deg=57 --nui_skeleton_camera_fov_y_deg=43
 ```
 
 ## Notes
