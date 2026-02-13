@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows-checked:
-    name: Build xenia-app (Checked)
+  build-windows-release:
+    name: Build xenia-app (Release)
     runs-on: windows-2022
     timeout-minutes: 120
 
@@ -24,13 +24,13 @@ jobs:
         shell: pwsh
         run: py -3 .\xenia-build setup
 
-      - name: Build xenia-app (Checked)
+      - name: Build xenia-app (Release)
         shell: pwsh
         run: |
           $buildArgs = @(
             '.\xenia-build',
             'build',
-            '--config', 'checked',
+            '--config', 'release',
             '-j', $env:NUMBER_OF_PROCESSORS,
             '--',
             '/v:minimal',
@@ -74,10 +74,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Upload Checked binaries
+      - name: Upload Release binaries
         uses: actions/upload-artifact@v4
         with:
-          name: xenia-windows-checked
-          path: build/bin/Windows/Checked/**
+          name: xenia-windows-release
+          path: build/bin/Windows/Release/**
           if-no-files-found: error
           retention-days: 14
