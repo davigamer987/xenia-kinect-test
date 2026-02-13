@@ -42,6 +42,13 @@ characterset("Unicode")
 flags({
   "FatalWarnings",        -- Treat warnings as errors.
 })
+filter("platforms:Windows")
+  -- Windows CI frequently pulls in toolchain/header warning churn from
+  -- dependencies; keep warnings visible but don't fail builds on them.
+  removeflags({
+    "FatalWarnings",
+  })
+filter({})
 
 filter("kind:StaticLib")
   defines({
