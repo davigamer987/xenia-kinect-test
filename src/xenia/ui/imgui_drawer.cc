@@ -11,6 +11,7 @@
 
 #include <cfloat>
 #include <cstring>
+#include <utility>
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/assert.h"
@@ -68,7 +69,7 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     // a dialog's Draw function, re-registering the ImGuiDrawer may result in
     // ImGui being drawn multiple times in the current frame.
     window_->AddInputListener(this, z_order_);
-    if (presenter_) {
+    if (presenter_ && draw_callbacks_.empty() && !IsDrawingDrawCallbacks()) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
   }
@@ -89,7 +90,50 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
     }
   }
   dialogs_.erase(it);
-  DetachIfLastDialogRemoved();
+  DetachIfInactive();
+}
+
+void ImGuiDrawer::AddDrawCallback(void* key,
+                                  std::function<void(ImGuiIO& io)> callback) {
+  assert_not_null(key);
+  assert_true(bool(callback));
+
+  auto it = std::find_if(
+      draw_callbacks_.begin(), draw_callbacks_.end(),
+      [key](const DrawCallbackEntry& entry) { return entry.key == key; });
+  if (it != draw_callbacks_.end()) {
+    it->callback = std::move(callback);
+    return;
+  }
+
+  if (dialogs_.empty() && draw_callbacks_.empty() && !IsDrawingDialogs() &&
+      !IsDrawingDrawCallbacks()) {
+    if (presenter_) {
+      presenter_->AddUIDrawerFromUIThread(this, z_order_);
+    }
+  }
+  draw_callbacks_.push_back({key, std::move(callback)});
+}
+
+void ImGuiDrawer::RemoveDrawCallback(void* key) {
+  assert_not_null(key);
+
+  auto it = std::find_if(
+      draw_callbacks_.cbegin(), draw_callbacks_.cend(),
+      [key](const DrawCallbackEntry& entry) { return entry.key == key; });
+  if (it == draw_callbacks_.cend()) {
+    return;
+  }
+
+  if (IsDrawingDrawCallbacks()) {
+    size_t existing_index = size_t(std::distance(draw_callbacks_.cbegin(), it));
+    if (draw_callback_loop_next_index_ > existing_index) {
+      --draw_callback_loop_next_index_;
+    }
+  }
+
+  draw_callbacks_.erase(it);
+  DetachIfInactive();
 }
 
 void ImGuiDrawer::Initialize() {
@@ -237,14 +281,13 @@ void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
     if (presenter_ == new_presenter) {
       return;
     }
-    if (!dialogs_.empty()) {
+    if (HasDrawContent()) {
       presenter_->RemoveUIDrawerFromUIThread(this);
     }
-    ImGuiIO& io = GetIO();
   }
   presenter_ = new_presenter;
   if (presenter_) {
-    if (!dialogs_.empty()) {
+    if (HasDrawContent()) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
   }
@@ -273,7 +316,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     return;
   }
 
-  if (dialogs_.empty()) {
+  if (dialogs_.empty() && draw_callbacks_.empty()) {
     return;
   }
 
@@ -307,6 +350,13 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   }
   dialog_loop_next_index_ = SIZE_MAX;
 
+  assert_true(!IsDrawingDrawCallbacks());
+  draw_callback_loop_next_index_ = 0;
+  while (draw_callback_loop_next_index_ < draw_callbacks_.size()) {
+    draw_callbacks_[draw_callback_loop_next_index_++].callback(io);
+  }
+  draw_callback_loop_next_index_ = SIZE_MAX;
+
   ImGui::Render();
   ImDrawData* draw_data = ImGui::GetDrawData();
   if (draw_data) {
@@ -320,9 +370,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   // Detaching is deferred if the last dialog is removed during drawing, perform
   // it now if needed.
-  DetachIfLastDialogRemoved();
+  DetachIfInactive();
 
-  if (!dialogs_.empty()) {
+  if (HasDrawContent()) {
     // Repaint (and handle input) continuously if still active.
     presenter_->RequestUIPaintFromUIThread();
   }
@@ -547,16 +597,16 @@ void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(
   UpdateMousePosition(float(e.x()), float(e.y()));
 }
 
-void ImGuiDrawer::DetachIfLastDialogRemoved() {
+void ImGuiDrawer::DetachIfInactive() {
   // IsDrawingDialogs() is also checked because in a situation of removing the
   // only dialog, then adding a dialog, from within a dialog's Draw function,
   // re-registering the ImGuiDrawer may result in ImGui being drawn multiple
   // times in the current frame.
-  if (!dialogs_.empty() || IsDrawingDialogs()) {
+  bool dialogs_active = !dialogs_.empty() || IsDrawingDialogs();
+  bool draw_callbacks_active =
+      !draw_callbacks_.empty() || IsDrawingDrawCallbacks();
+  if (dialogs_active) {
     return;
-  }
-  if (presenter_) {
-    presenter_->RemoveUIDrawerFromUIThread(this);
   }
   window_->RemoveInputListener(this);
   // Clear all input since no input will be received anymore, and when the
@@ -564,6 +614,9 @@ void ImGuiDrawer::DetachIfLastDialogRemoved() {
   // which will be persistent until new events actualize individual input
   // properties.
   ClearInput();
+  if (!draw_callbacks_active && presenter_) {
+    presenter_->RemoveUIDrawerFromUIThread(this);
+  }
 }
 
 }  // namespace ui

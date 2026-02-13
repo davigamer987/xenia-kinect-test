@@ -1,0 +1,37 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-checked:
+    name: Build xenia-app (Checked)
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run setup
+        shell: pwsh
+        run: py -3 .\xenia-build setup
+
+      - name: Build xenia-app (Checked)
+        shell: pwsh
+        run: py -3 .\xenia-build build --config checked --target xenia-app -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Upload Checked binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenia-windows-checked
+          path: build/bin/Windows/Checked/**
+          if-no-files-found: error
+          retention-days: 14

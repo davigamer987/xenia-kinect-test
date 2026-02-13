@@ -100,6 +100,19 @@ X_HRESULT XamApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
              (uint32_t)data->unk_04);
       return X_E_SUCCESS;
     }
+    case 0x0002B003: {
+      // Kinect runtime initialization message observed in multiple titles.
+      struct message_data {
+        xe::be<uint64_t> unk_00;
+        xe::be<uint64_t> unk_08;
+        xe::be<uint64_t> unk_10;
+      }* data = reinterpret_cast<message_data*>(buffer);
+      XELOGD("XamApp(0x0002B003)({:016X}, {:016X}, {:016X})",
+             static_cast<uint64_t>(data->unk_00),
+             static_cast<uint64_t>(data->unk_08),
+             static_cast<uint64_t>(data->unk_10));
+      return X_E_SUCCESS;
+    }
   }
   XELOGE(
       "Unimplemented XAM message app={:08X}, msg={:08X}, arg1={:08X}, "

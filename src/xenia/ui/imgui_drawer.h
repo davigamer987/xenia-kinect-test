@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -41,6 +42,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void AddDialog(ImGuiDialog* dialog);
   void RemoveDialog(ImGuiDialog* dialog);
+  void AddDrawCallback(void* key, std::function<void(ImGuiIO& io)> callback);
+  void RemoveDrawCallback(void* key);
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
@@ -76,8 +79,14 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void UpdateMousePosition(float x, float y);
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
+  bool HasDrawContent() const {
+    return !dialogs_.empty() || !draw_callbacks_.empty();
+  }
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
-  void DetachIfLastDialogRemoved();
+  bool IsDrawingDrawCallbacks() const {
+    return draw_callback_loop_next_index_ != SIZE_MAX;
+  }
+  void DetachIfInactive();
 
   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
 
@@ -93,6 +102,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // range that would be invalidated.
   // SIZE_MAX if not currently in the dialog loop.
   size_t dialog_loop_next_index_ = SIZE_MAX;
+  struct DrawCallbackEntry {
+    void* key;
+    std::function<void(ImGuiIO& io)> callback;
+  };
+  std::vector<DrawCallbackEntry> draw_callbacks_;
+  // SIZE_MAX if not currently in the callback loop.
+  size_t draw_callback_loop_next_index_ = SIZE_MAX;
 
   Presenter* presenter_ = nullptr;
 

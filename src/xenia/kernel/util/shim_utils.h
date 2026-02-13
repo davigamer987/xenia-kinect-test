@@ -368,6 +368,7 @@ using pointer_t = const shim::TypedPointerParam<T>&;
 
 using int_result_t = shim::ResultBase<int32_t>;
 using dword_result_t = shim::ResultBase<uint32_t>;
+using qword_result_t = shim::ResultBase<uint64_t>;
 using pointer_result_t = shim::ResultBase<uint32_t>;
 using X_HRESULT_result_t = shim::ResultBase<X_HRESULT>;
 
@@ -524,7 +525,7 @@ xe::cpu::Export* RegisterExport(R (*fn)(Ps&...), const char* name,
   static const auto export_entry = new cpu::Export(
       ORDINAL, xe::cpu::Export::Type::kFunction, name,
       tags | xe::cpu::ExportTag::kImplemented | xe::cpu::ExportTag::kLog);
-  static R (*FN)(Ps & ...) = fn;
+  static R (*FN)(Ps&...) = fn;
   struct X {
     static void Trampoline(PPCContext* ppc_context) {
       ++export_entry->function_data.call_count;

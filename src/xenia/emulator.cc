@@ -728,6 +728,20 @@ static std::string format_version(xex2_version version) {
 
 X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
                                   const std::string_view module_path) {
+  if (!display_window_->app_context().IsInUIThread()) {
+    // Game config callbacks and window updates during launch expect the UI
+    // thread, so marshal launch completion there when called externally from the
+    // emulator thread.
+    X_STATUS result = X_STATUS_UNSUCCESSFUL;
+    std::filesystem::path path_copy = path;
+    std::string module_path_copy = std::string(module_path);
+    bool call_queued = display_window_->app_context().CallInUIThreadSynchronous(
+        [this, &result, &path_copy, &module_path_copy]() {
+          result = CompleteLaunch(path_copy, module_path_copy);
+        });
+    return call_queued ? result : X_STATUS_UNSUCCESSFUL;
+  }
+
   // Making changes to the UI (setting the icon) and executing game config load
   // callbacks which expect to be called from the UI thread.
   assert_true(display_window_->app_context().IsInUIThread());
