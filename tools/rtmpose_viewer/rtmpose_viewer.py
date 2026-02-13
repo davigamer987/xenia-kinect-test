@@ -63,6 +63,9 @@ DEFAULT_MODELS = {
 
 NUI_UDP_MAGIC = 0x584E5549  # "XNUI"
 NUI_UDP_VERSION = 1
+NUI_UDP_COLOR_MAGIC = 0x31424752  # "RGB1"
+NUI_UDP_COLOR_FORMAT_RGB24 = 1
+NUI_UDP_MAX_PAYLOAD = 65507
 
 
 def parse_source(raw_source: str) -> int | str:
@@ -267,6 +270,7 @@ def build_nui_udp_payload(
     frame_index: int,
     score_threshold: float,
     depth_estimator: NuiDepthEstimator | None,
+    color_extension: tuple[int, int, bytes] | None = None,
 ) -> bytes:
     frame_height, frame_width = frame.shape[:2]
 
@@ -303,6 +307,8 @@ def build_nui_udp_payload(
             # Normalize to a camera-like space.
             x_norm = (x_px / max(frame_width, 1)) * 2.0 - 1.0
             y_norm = 1.0 - (y_px / max(frame_height, 1)) * 2.0
+            x_norm = max(-1.0, min(1.0, x_norm))
+            y_norm = max(-1.0, min(1.0, y_norm))
             z_norm = float(depth_meters[i]) if i < len(depth_meters) else 2.0
 
             if confidence >= score_threshold:
@@ -329,6 +335,29 @@ def build_nui_udp_payload(
     frame_width_u16 = max(0, min(int(frame_width), 0xFFFF))
     frame_height_u16 = max(0, min(int(frame_height), 0xFFFF))
     payload.extend(struct.pack("<HH", frame_width_u16, frame_height_u16))
+    base_payload = bytes(payload)
+
+    if color_extension is not None:
+        color_width, color_height, color_bytes = color_extension
+        if color_width > 0 and color_height > 0 and color_bytes:
+            color_size = len(color_bytes)
+            payload.extend(
+                struct.pack(
+                    "<IHHBBHI",
+                    NUI_UDP_COLOR_MAGIC,
+                    int(color_width) & 0xFFFF,
+                    int(color_height) & 0xFFFF,
+                    NUI_UDP_COLOR_FORMAT_RGB24,
+                    0,
+                    0,
+                    color_size,
+                )
+            )
+            payload.extend(color_bytes)
+
+    if len(payload) > NUI_UDP_MAX_PAYLOAD:
+        # Keep skeleton delivery reliable; drop color extension if packet grew too large.
+        return base_payload
 
     return bytes(payload)
 
@@ -494,10 +523,11 @@ def create_video_writer(output_path: str, capture):
     return writer
 
 
-def overlay_status(frame: Any, device: str, fps: float) -> None:
+def overlay_status(frame: Any, device: str, fps: float, skeleton_only: bool) -> None:
     import cv2
 
-    text = f"device={device} fps={fps:5.1f} (q/esc to quit)"
+    view_mode = "skeleton-only" if skeleton_only else "camera+overlay"
+    text = f"device={device} fps={fps:5.1f} view={view_mode} (q/esc to quit)"
     cv2.putText(
         frame,
         text,
@@ -508,6 +538,45 @@ def overlay_status(frame: Any, device: str, fps: float) -> None:
         2,
         cv2.LINE_AA,
     )
+
+
+def draw_view_mode_button(frame: Any, skeleton_only: bool) -> tuple[int, int, int, int]:
+    import cv2
+
+    label = "Skeleton Only: ON" if skeleton_only else "Skeleton Only: OFF"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.60
+    thickness = 2
+    text_size, baseline = cv2.getTextSize(label, font, font_scale, thickness)
+
+    pad_x = 12
+    pad_y = 8
+    margin = 10
+    button_w = text_size[0] + (pad_x * 2)
+    button_h = text_size[1] + (pad_y * 2) + baseline
+
+    frame_h, frame_w = frame.shape[:2]
+    x1 = max(frame_w - button_w - margin, 0)
+    y1 = min(max(margin, 0), max(frame_h - button_h, 0))
+    x2 = min(x1 + button_w, frame_w - 1)
+    y2 = min(y1 + button_h, frame_h - 1)
+
+    fill_color = (40, 150, 40) if skeleton_only else (65, 65, 65)
+    border_color = (170, 255, 170) if skeleton_only else (220, 220, 220)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), fill_color, -1)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), border_color, 2)
+    text_org = (x1 + pad_x, y1 + pad_y + text_size[1])
+    cv2.putText(
+        frame,
+        label,
+        text_org,
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+    return x1, y1, x2, y2
 
 
 def run_viewer(args: argparse.Namespace) -> int:
@@ -525,6 +594,8 @@ def run_viewer(args: argparse.Namespace) -> int:
     nui_socket: socket.socket | None = None
     nui_target: tuple[str, int] | None = None
     nui_depth_estimator: NuiDepthEstimator | None = None
+    nui_rgb_last_send_time = 0.0
+    nui_rgb_interval = 0.0
 
     if args.nui_udp_target:
         nui_target = parse_udp_target(args.nui_udp_target)
@@ -562,6 +633,33 @@ def run_viewer(args: argparse.Namespace) -> int:
                 f"shoulder={args.nui_assumed_shoulder_width_m:.3f}m "
                 f"height={args.nui_assumed_height_m:.3f}m"
             )
+        if args.nui_rgb_stream:
+            nui_rgb_interval = 1.0 / max(float(args.nui_rgb_fps), 1.0)
+            print(
+                "NUI RGB stream enabled: "
+                f"{args.nui_rgb_width}x{args.nui_rgb_height} "
+                f"at ~{args.nui_rgb_fps:.1f} fps (RGB24 extension)"
+            )
+
+    view_state: dict[str, Any] = {
+        "skeleton_only": False,
+        "button_rect": (0, 0, 0, 0),
+    }
+
+    def on_mouse(event: int, x: int, y: int, flags: int, param: Any) -> None:
+        if event != cv2.EVENT_LBUTTONUP:
+            return
+        if not isinstance(param, dict):
+            return
+        rect = param.get("button_rect", (0, 0, 0, 0))
+        if len(rect) != 4:
+            return
+        x1, y1, x2, y2 = rect
+        if x1 <= x <= x2 and y1 <= y <= y2:
+            param["skeleton_only"] = not bool(param.get("skeleton_only", False))
+
+    cv2.namedWindow(args.window_name, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(args.window_name, on_mouse, view_state)
 
     frame_count = 0
     start_time = time.perf_counter()
@@ -572,9 +670,13 @@ def run_viewer(args: argparse.Namespace) -> int:
             if not ok:
                 break
 
+            base_frame = frame.copy()
+            if view_state["skeleton_only"]:
+                base_frame.fill(0)
+
             keypoints, scores = pose(frame)
             rendered = draw_skeleton(
-                frame.copy(),
+                base_frame,
                 keypoints,
                 scores,
                 openpose_skeleton=args.openpose_skeleton,
@@ -586,12 +688,36 @@ def run_viewer(args: argparse.Namespace) -> int:
             frame_count += 1
             elapsed = max(time.perf_counter() - start_time, 1e-6)
             fps = frame_count / elapsed
-            overlay_status(rendered, args.runtime_device, fps)
+            overlay_status(
+                rendered,
+                args.runtime_device,
+                fps,
+                bool(view_state["skeleton_only"]),
+            )
+            view_state["button_rect"] = draw_view_mode_button(
+                rendered, bool(view_state["skeleton_only"])
+            )
 
             if writer is not None:
                 writer.write(rendered)
 
             if nui_socket is not None and nui_target is not None:
+                color_extension: tuple[int, int, bytes] | None = None
+                if args.nui_rgb_stream:
+                    now = time.perf_counter()
+                    if (now - nui_rgb_last_send_time) >= nui_rgb_interval:
+                        rgb_source = cv2.resize(
+                            frame,
+                            (args.nui_rgb_width, args.nui_rgb_height),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        rgb_image = cv2.cvtColor(rgb_source, cv2.COLOR_BGR2RGB)
+                        color_extension = (
+                            args.nui_rgb_width,
+                            args.nui_rgb_height,
+                            rgb_image.tobytes(),
+                        )
+                        nui_rgb_last_send_time = now
                 packet = build_nui_udp_payload(
                     frame,
                     keypoints,
@@ -599,6 +725,7 @@ def run_viewer(args: argparse.Namespace) -> int:
                     frame_count,
                     args.nui_score_thr,
                     nui_depth_estimator,
+                    color_extension=color_extension,
                 )
                 nui_socket.sendto(packet, nui_target)
 
@@ -683,6 +810,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Kinect bridge target as HOST:PORT (for Xenia NUI UDP input).",
     )
     parser.add_argument(
+        "--nui-rgb-stream",
+        action="store_true",
+        help="Attach downscaled RGB camera frames to the NUI UDP stream.",
+    )
+    parser.add_argument(
+        "--nui-rgb-width",
+        type=int,
+        default=160,
+        help="RGB extension frame width (kept small to fit a single UDP packet).",
+    )
+    parser.add_argument(
+        "--nui-rgb-height",
+        type=int,
+        default=120,
+        help="RGB extension frame height (kept small to fit a single UDP packet).",
+    )
+    parser.add_argument(
+        "--nui-rgb-fps",
+        type=float,
+        default=15.0,
+        help="Target RGB extension send rate in frames per second.",
+    )
+    parser.add_argument(
         "--nui-score-thr",
         type=float,
         default=0.35,
@@ -760,6 +910,10 @@ def main() -> int:
     args = build_parser().parse_args()
     if args.nui_z_min >= args.nui_z_max:
         raise SystemExit("ERROR: --nui-z-min must be lower than --nui-z-max.")
+    if args.nui_rgb_width < 32 or args.nui_rgb_height < 24:
+        raise SystemExit("ERROR: --nui-rgb-width/height are too small.")
+    if args.nui_rgb_fps <= 0.0:
+        raise SystemExit("ERROR: --nui-rgb-fps must be > 0.")
 
     if args.torch_home:
         os.environ["TORCH_HOME"] = args.torch_home

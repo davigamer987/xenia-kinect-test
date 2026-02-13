@@ -42,7 +42,7 @@ Video file:
 python rtmpose_viewer.py --source /path/to/video.mp4 --mode balanced
 ```
 
-Press `q` or `Esc` to exit.
+Press `q` or `Esc` to exit. Click the top-right `Skeleton Only` button to hide/show the camera image.
 
 ## 4) Stream to Xenia Kinect Bridge
 
@@ -50,6 +50,14 @@ Run viewer with UDP output enabled:
 
 ```bash
 python rtmpose_viewer.py --source 0 --mode balanced --nui-udp-target 127.0.0.1:37100
+```
+
+To also send an RGB camera stream (downscaled RGB24 extension in the same UDP
+packet) for NUI camera APIs:
+
+```bash
+python rtmpose_viewer.py --source 0 --mode balanced --nui-udp-target 127.0.0.1:37100 \
+  --nui-rgb-stream --nui-rgb-width 160 --nui-rgb-height 120 --nui-rgb-fps 15
 ```
 
 Depth-model tuning (recommended for gesture-heavy titles):
@@ -80,6 +88,12 @@ Run Xenia with NUI enabled and UDP bridge enabled:
 --allow_nui_initialization=true --nui_sensor_udp_enabled=true --nui_sensor_udp_port=37100 --show_kinect_debug=true
 ```
 
+Optional NUI color output tuning in Xenia (used by camera bridge shims):
+
+```bash
+--nui_sensor_color_output_width=640 --nui_sensor_color_output_height=480 --nui_sensor_color_nominal_fps=30 --nui_sensor_color_format_fourcc=0x32595559
+```
+
 For detailed game/NUI call tracing and a dedicated in-emulator log window:
 
 ```bash
@@ -97,6 +111,13 @@ To include generic `xam.xex` extern dispatches that look Kinect-related
 
 ```bash
 --nui_trace_all_xam_import_calls=true
+```
+
+To trace every `xam.xex` extern call (including non-NUI paths such as
+`XamInput*`, very noisy but useful for diagnostics):
+
+```bash
+--nui_trace_all_xam_calls=true
 ```
 
 If a title uses a different argument index for `XamNuiSkeletonScoreUpdate`
@@ -133,3 +154,4 @@ If the sender provides normalized camera joints (default RTMPose bridge), keep
   - optional height anchor: nose-to-ankle pixel span
   - `f` comes from `--nui-focal-length-px` or from `--nui-camera-fov-deg`
 - NUI UDP packet format (little-endian): `u32 magic='XNUI'`, `u16 version=1`, `u16 joint_count`, `u32 tracked_flag`, `u32 frame_index`, `u64 timestamp_us`, followed by `joint_count` entries of `f32 x, f32 y, f32 z, f32 confidence`. An optional tail of `u16 frame_width, u16 frame_height` may be appended.
+- Optional color extension tail after the frame-size tail: `u32 color_magic='RGB1'`, `u16 color_width`, `u16 color_height`, `u8 color_format=1 (RGB24)`, `u8 reserved0`, `u16 reserved1`, `u32 color_payload_size`, then `color_payload_size` bytes of tightly packed RGB24.
