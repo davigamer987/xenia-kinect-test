@@ -271,7 +271,7 @@ def build_nui_udp_payload(
     score_threshold: float,
     depth_estimator: NuiDepthEstimator | None,
     color_extension: tuple[int, int, bytes] | None = None,
-) -> bytes:
+) -> tuple[bytes, bool]:
     frame_height, frame_width = frame.shape[:2]
 
     joint_tuples: list[tuple[float, float, float, float]] = []
@@ -354,12 +354,17 @@ def build_nui_udp_payload(
                 )
             )
             payload.extend(color_bytes)
+            color_attached = True
+        else:
+            color_attached = False
+    else:
+        color_attached = False
 
     if len(payload) > NUI_UDP_MAX_PAYLOAD:
         # Keep skeleton delivery reliable; drop color extension if packet grew too large.
-        return base_payload
+        return base_payload, False
 
-    return bytes(payload)
+    return bytes(payload), color_attached
 
 
 def _shared_lib_mode() -> int:
@@ -596,6 +601,7 @@ def run_viewer(args: argparse.Namespace) -> int:
     nui_depth_estimator: NuiDepthEstimator | None = None
     nui_rgb_last_send_time = 0.0
     nui_rgb_interval = 0.0
+    nui_rgb_drop_warned = False
 
     if args.nui_udp_target:
         nui_target = parse_udp_target(args.nui_udp_target)
@@ -718,7 +724,7 @@ def run_viewer(args: argparse.Namespace) -> int:
                             rgb_image.tobytes(),
                         )
                         nui_rgb_last_send_time = now
-                packet = build_nui_udp_payload(
+                packet, color_attached = build_nui_udp_payload(
                     frame,
                     keypoints,
                     scores,
@@ -727,6 +733,16 @@ def run_viewer(args: argparse.Namespace) -> int:
                     nui_depth_estimator,
                     color_extension=color_extension,
                 )
+                if (
+                    color_extension is not None
+                    and not color_attached
+                    and not nui_rgb_drop_warned
+                ):
+                    print(
+                        "Warning: RGB extension was dropped to keep UDP payload under "
+                        f"{NUI_UDP_MAX_PAYLOAD} bytes."
+                    )
+                    nui_rgb_drop_warned = True
                 nui_socket.sendto(packet, nui_target)
 
             cv2.imshow(args.window_name, rendered)
@@ -811,8 +827,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--nui-rgb-stream",
+        dest="nui_rgb_stream",
         action="store_true",
-        help="Attach downscaled RGB camera frames to the NUI UDP stream.",
+        default=True,
+        help="Attach downscaled RGB camera frames to the NUI UDP stream (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-nui-rgb-stream",
+        dest="nui_rgb_stream",
+        action="store_false",
+        help="Disable RGB camera extension in the NUI UDP stream.",
     )
     parser.add_argument(
         "--nui-rgb-width",

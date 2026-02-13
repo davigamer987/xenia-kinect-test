@@ -99,7 +99,7 @@ DEFINE_int32(
     "XamNuiSkeletonScoreUpdate (-1 disables writing).",
     "Kernel");
 DEFINE_int32(
-    nui_device_status_value, 1,
+    nui_device_status_value, 2,
     "Connected status value reported by XamNuiGetDeviceStatus.",
     "Kernel");
 DEFINE_int32(
@@ -117,7 +117,7 @@ DEFINE_bool(
     "and append them to the Kinect NUI log.",
     "Kernel");
 DEFINE_bool(
-    nui_trace_all_xam_calls, false,
+    nui_trace_all_xam_calls, true,
     "Trace every xam extern dispatch/undefined call into the Kinect NUI log "
     "(very noisy, useful for call-path debugging).",
     "Kernel");
@@ -196,6 +196,9 @@ constexpr uint32_t kNuiUdpColorMagic = 0x31424752;  // "RGB1"
 constexpr size_t kNuiUdpColorHeaderSize = 16;
 constexpr uint8_t kNuiUdpColorFormatRgb24 = 1;
 constexpr size_t kNuiUdpMaxColorPayloadSize = 60000;
+constexpr uint32_t kNuiColorFormatYUY2 = 0x32595559;  // "YUY2"
+constexpr uint32_t kNuiColorFormatRGB3 = 0x33424752;  // "RGB3"
+constexpr uint32_t kNuiColorFormatBGRX = 0x58524742;  // "BGRX"
 constexpr float kPi = 3.14159265358979323846f;
 
 struct NuiJoint {
@@ -588,6 +591,83 @@ float TanHalfFovRadians(double fov_degrees) {
   const float clamped = std::clamp(float(fov_degrees), 1.0f, 179.0f);
   const float radians = clamped * (kPi / 180.0f);
   return std::tan(radians * 0.5f);
+}
+
+std::string FourCCToString(uint32_t fourcc) {
+  std::string out(4, '.');
+  out[0] = std::isprint(int((fourcc >> 0) & 0xFF))
+               ? char((fourcc >> 0) & 0xFF)
+               : '.';
+  out[1] = std::isprint(int((fourcc >> 8) & 0xFF))
+               ? char((fourcc >> 8) & 0xFF)
+               : '.';
+  out[2] = std::isprint(int((fourcc >> 16) & 0xFF))
+               ? char((fourcc >> 16) & 0xFF)
+               : '.';
+  out[3] = std::isprint(int((fourcc >> 24) & 0xFF))
+               ? char((fourcc >> 24) & 0xFF)
+               : '.';
+  return out;
+}
+
+uint8_t ClampColorToByte(int value) {
+  return uint8_t(std::clamp(value, 0, 255));
+}
+
+uint8_t RgbToY(uint8_t r, uint8_t g, uint8_t b) {
+  const int y = ((66 * int(r) + 129 * int(g) + 25 * int(b) + 128) >> 8) + 16;
+  return ClampColorToByte(y);
+}
+
+uint8_t RgbToU(uint8_t r, uint8_t g, uint8_t b) {
+  const int u = ((-38 * int(r) - 74 * int(g) + 112 * int(b) + 128) >> 8) + 128;
+  return ClampColorToByte(u);
+}
+
+uint8_t RgbToV(uint8_t r, uint8_t g, uint8_t b) {
+  const int v = ((112 * int(r) - 94 * int(g) - 18 * int(b) + 128) >> 8) + 128;
+  return ClampColorToByte(v);
+}
+
+bool ConvertBgraToYuy2(const std::vector<uint8_t>& bgra, uint32_t width,
+                       uint32_t height, std::vector<uint8_t>* out_yuy2) {
+  if (!out_yuy2 || !width || !height || (width & 1u)) {
+    return false;
+  }
+  const size_t bgra_size = size_t(width) * size_t(height) * 4u;
+  if (bgra.size() < bgra_size) {
+    return false;
+  }
+  out_yuy2->resize(size_t(width) * size_t(height) * 2u);
+  uint8_t* dst = out_yuy2->data();
+  for (uint32_t y = 0; y < height; ++y) {
+    for (uint32_t x = 0; x < width; x += 2) {
+      const size_t i0 = (size_t(y) * width + x) * 4u;
+      const size_t i1 = i0 + 4u;
+      const uint8_t b0 = bgra[i0 + 0];
+      const uint8_t g0 = bgra[i0 + 1];
+      const uint8_t r0 = bgra[i0 + 2];
+      const uint8_t b1 = bgra[i1 + 0];
+      const uint8_t g1 = bgra[i1 + 1];
+      const uint8_t r1 = bgra[i1 + 2];
+
+      const uint8_t y0 = RgbToY(r0, g0, b0);
+      const uint8_t y1 = RgbToY(r1, g1, b1);
+      const uint8_t u0 = RgbToU(r0, g0, b0);
+      const uint8_t u1 = RgbToU(r1, g1, b1);
+      const uint8_t v0 = RgbToV(r0, g0, b0);
+      const uint8_t v1 = RgbToV(r1, g1, b1);
+
+      const uint8_t u = uint8_t((uint32_t(u0) + uint32_t(u1)) / 2u);
+      const uint8_t v = uint8_t((uint32_t(v0) + uint32_t(v1)) / 2u);
+      const size_t o = (size_t(y) * width + x) * 2u;
+      dst[o + 0] = y0;
+      dst[o + 1] = u;
+      dst[o + 2] = y1;
+      dst[o + 3] = v;
+    }
+  }
+  return true;
 }
 
 void SetVector(X_NUI_VECTOR4* vector, float x, float y, float z, float w) {
@@ -1304,6 +1384,18 @@ class NuiUdpSensorService {
           color_rgb24.resize(color_payload_size);
           std::memcpy(color_rgb24.data(), data + payload_offset, color_payload_size);
           has_color_extension = true;
+        } else {
+          const uint32_t dropped =
+              dropped_color_extension_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (dropped <= 4 || (dropped % 120u) == 0u) {
+            LogNui(
+                "RX color dropped frame={} reason={}{} fmt={} wh={}x{} payload={} max={}",
+                frame_index, payload_in_range ? "" : "range",
+                payload_valid ? "" : (payload_in_range ? "invalid" : "+invalid"),
+                uint32_t(color_format), uint32_t(color_width),
+                uint32_t(color_height), color_payload_size,
+                uint32_t(kNuiUdpMaxColorPayloadSize));
+          }
         }
       }
     }
@@ -1378,6 +1470,13 @@ class NuiUdpSensorService {
       latest_color_frame_.host_receive_us = host_receive_us;
       latest_color_frame_.rgb24 = std::move(color_rgb24);
       last_color_host_us_.store(host_receive_us, std::memory_order_relaxed);
+      bool expected = false;
+      if (received_any_color_frame_.compare_exchange_strong(
+              expected, true, std::memory_order_relaxed)) {
+        LogNui("RX first color frame={} rgb={}x{} bytes={}", frame_index,
+               uint32_t(color_width), uint32_t(color_height),
+               uint32_t(latest_color_frame_.rgb24.size()));
+      }
     }
 
     const int log_interval = std::max(cvars::nui_sensor_log_frame_interval, 0);
@@ -1418,22 +1517,47 @@ class NuiUdpSensorService {
   mutable std::mutex color_mutex_;
   NuiColorFrame latest_color_frame_ = {};
   std::atomic<uint64_t> last_color_host_us_ = 0;
+  std::atomic<uint32_t> dropped_color_extension_count_ = 0;
+  std::atomic<bool> received_any_color_frame_ = false;
 };
+
+uint32_t engaged_tracking_id = 0;
+uint32_t engaged_enrollment_index = 0;
+uint64_t nui_session_id = 0;
+std::atomic<bool> nui_force_device_off = false;
+uint32_t nui_system_gesture_control = 1;
+
+std::mutex g_nui_color_texture_mutex;
+uint32_t g_nui_color_texture_guest_ptr = 0;
+uint32_t g_nui_color_texture_capacity = 0;
+uint32_t g_nui_color_texture_width = 0;
+uint32_t g_nui_color_texture_height = 0;
+uint32_t g_nui_color_texture_frame_index = 0;
+uint32_t g_nui_color_texture_format_fourcc = kNuiColorFormatYUY2;
+std::atomic<uint32_t> g_nui_color_miss_count = 0;
+std::atomic<uint32_t> g_nui_color_update_count = 0;
 
 bool IsNuiDeviceConnected() {
   if (!cvars::allow_nui_initialization) {
     return false;
   }
+  if (nui_force_device_off.load(std::memory_order_relaxed)) {
+    return false;
+  }
   if (!cvars::nui_sensor_udp_enabled) {
     return true;
   }
+  // Treat the virtual Kinect as connected whenever the bridge is enabled.
   auto& sensor = NuiUdpSensorService::Get();
   sensor.EnsureRunning();
-  return sensor.HasRecentFrame();
+  return true;
 }
 
 bool IsNuiSkeletonTracked() {
   if (!cvars::allow_nui_initialization) {
+    return false;
+  }
+  if (nui_force_device_off.load(std::memory_order_relaxed)) {
     return false;
   }
   if (!cvars::nui_sensor_udp_enabled) {
@@ -1444,46 +1568,130 @@ bool IsNuiSkeletonTracked() {
   return sensor.IsTracked();
 }
 
-std::mutex g_nui_color_texture_mutex;
-uint32_t g_nui_color_texture_guest_ptr = 0;
-uint32_t g_nui_color_texture_capacity = 0;
-uint32_t g_nui_color_texture_width = 0;
-uint32_t g_nui_color_texture_height = 0;
-uint32_t g_nui_color_texture_frame_index = 0;
-
 bool UpdateNuiColorTextureFromSensor(uint32_t* out_guest_ptr, uint32_t* out_width,
                                      uint32_t* out_height,
-                                     uint32_t* out_frame_index) {
+                                     uint32_t* out_frame_index,
+                                     uint32_t* out_format_fourcc) {
   NuiUdpSensorService& sensor = NuiUdpSensorService::Get();
   sensor.EnsureRunning();
-  const uint16_t target_width =
+  uint16_t target_width =
       uint16_t(std::clamp(cvars::nui_sensor_color_output_width, 16, 1920));
   const uint16_t target_height =
       uint16_t(std::clamp(cvars::nui_sensor_color_output_height, 16, 1080));
+
+  uint32_t output_format =
+      uint32_t(std::max(cvars::nui_sensor_color_format_fourcc, 0));
+  if (!output_format) {
+    output_format = kNuiColorFormatYUY2;
+  }
+  if (output_format == kNuiColorFormatYUY2 && (target_width & 1u)) {
+    target_width = uint16_t(std::max(16, int(target_width & ~1u)));
+  }
+
   std::vector<uint8_t> bgra;
   uint32_t frame_index = 0;
-  if (!sensor.BuildLatestColorBgra(target_width, target_height, &bgra,
-                                   &frame_index)) {
+  const bool has_fresh_color =
+      sensor.BuildLatestColorBgra(target_width, target_height, &bgra, &frame_index);
+  if (!has_fresh_color) {
+    const uint32_t miss =
+        g_nui_color_miss_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+      std::lock_guard<std::mutex> lock(g_nui_color_texture_mutex);
+      if (g_nui_color_texture_guest_ptr) {
+        if (out_guest_ptr) {
+          *out_guest_ptr = g_nui_color_texture_guest_ptr;
+        }
+        if (out_width) {
+          *out_width = g_nui_color_texture_width;
+        }
+        if (out_height) {
+          *out_height = g_nui_color_texture_height;
+        }
+        if (out_frame_index) {
+          *out_frame_index = g_nui_color_texture_frame_index;
+        }
+        if (out_format_fourcc) {
+          *out_format_fourcc = g_nui_color_texture_format_fourcc;
+        }
+        if (miss <= 4 || (miss % 120u) == 0u) {
+          LogNui(
+              "NUI color: using cached texture frame={} fmt={}({:08X}) wh={}x{}",
+              g_nui_color_texture_frame_index,
+              FourCCToString(g_nui_color_texture_format_fourcc),
+              g_nui_color_texture_format_fourcc, g_nui_color_texture_width,
+              g_nui_color_texture_height);
+        }
+        return true;
+      }
+    }
+    if (miss <= 4 || (miss % 120u) == 0u) {
+      LogNui(
+          "NUI color: no RGB frame available yet (fmt={}({:08X}) target={}x{})",
+          FourCCToString(output_format), output_format, uint32_t(target_width),
+          uint32_t(target_height));
+    }
     return false;
   }
-  const uint32_t required_size =
-      uint32_t(target_width) * uint32_t(target_height) * 4u;
+
+  std::vector<uint8_t> texture_bytes;
+  if (output_format == kNuiColorFormatYUY2) {
+    if (!ConvertBgraToYuy2(bgra, target_width, target_height, &texture_bytes)) {
+      LogNui("NUI color: failed YUY2 conversion for {}x{}", uint32_t(target_width),
+             uint32_t(target_height));
+      return false;
+    }
+  } else if (output_format == kNuiColorFormatRGB3) {
+    texture_bytes.resize(size_t(target_width) * size_t(target_height) * 3u);
+    for (size_t i = 0, j = 0; i + 3 < bgra.size(); i += 4, j += 3) {
+      texture_bytes[j + 0] = bgra[i + 2];
+      texture_bytes[j + 1] = bgra[i + 1];
+      texture_bytes[j + 2] = bgra[i + 0];
+    }
+  } else {
+    if (output_format != kNuiColorFormatBGRX) {
+      LogNui(
+          "NUI color: unsupported format {}({:08X}), using BGRX texture payload",
+          FourCCToString(output_format), output_format);
+    }
+    output_format = kNuiColorFormatBGRX;
+    texture_bytes = std::move(bgra);
+  }
+
+  const size_t required_size = texture_bytes.size();
+  if (!required_size) {
+    return false;
+  }
+
   std::lock_guard<std::mutex> lock(g_nui_color_texture_mutex);
   if (!g_nui_color_texture_guest_ptr ||
       g_nui_color_texture_capacity < required_size) {
-    const uint32_t guest_ptr = kernel_memory()->SystemHeapAlloc(required_size, 0x100);
+    const uint32_t guest_ptr =
+        kernel_memory()->SystemHeapAlloc(uint32_t(required_size), 0x100);
     if (!guest_ptr) {
       return false;
     }
     g_nui_color_texture_guest_ptr = guest_ptr;
-    g_nui_color_texture_capacity = required_size;
+    g_nui_color_texture_capacity = uint32_t(required_size);
   }
-  if (!WriteGuestBytes(g_nui_color_texture_guest_ptr, bgra.data(), bgra.size())) {
+  if (!WriteGuestBytes(g_nui_color_texture_guest_ptr, texture_bytes.data(),
+                       texture_bytes.size())) {
     return false;
   }
   g_nui_color_texture_width = target_width;
   g_nui_color_texture_height = target_height;
   g_nui_color_texture_frame_index = frame_index;
+  g_nui_color_texture_format_fourcc = output_format;
+
+  const uint32_t update_count =
+      g_nui_color_update_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (update_count <= 4 || (update_count % 120u) == 0u) {
+    LogNui(
+        "NUI color: updated frame={} fmt={}({:08X}) wh={}x{} bytes={}",
+        frame_index, FourCCToString(output_format), output_format,
+        uint32_t(target_width), uint32_t(target_height),
+        uint32_t(texture_bytes.size()));
+  }
+
   if (out_guest_ptr) {
     *out_guest_ptr = g_nui_color_texture_guest_ptr;
   }
@@ -1496,11 +1704,11 @@ bool UpdateNuiColorTextureFromSensor(uint32_t* out_guest_ptr, uint32_t* out_widt
   if (out_frame_index) {
     *out_frame_index = g_nui_color_texture_frame_index;
   }
+  if (out_format_fourcc) {
+    *out_format_fourcc = g_nui_color_texture_format_fourcc;
+  }
   return true;
 }
-
-uint32_t engaged_tracking_id = 0;
-uint64_t nui_session_id = 0;
 
 uint32_t XeXamNuiHudCheck(dword_t tracking_id) {
   if (!IsNuiDeviceConnected()) {
@@ -1605,6 +1813,51 @@ dword_result_t XamNuiGetDepthCalibration_entry(lpdword_t unk1) {
 }
 DECLARE_XAM_EXPORT1(XamNuiGetDepthCalibration, kNone, kStub);
 
+dword_result_t XamNuiStoreDepthCalibration_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui(
+      "XamNuiStoreDepthCalibration({:08X}, {:08X}, {:08X}, {:08X}) -> {}",
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiStoreDepthCalibration, kNone, kImplemented);
+
+dword_result_t XamNuiGetLoadedDepthCalibration_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3) {
+  const std::array<uint32_t, 4> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3)};
+  const bool connected = IsNuiDeviceConnected();
+  std::array<uint32_t, 8> args8 = {args[0], args[1], args[2], args[3], 0, 0, 0, 0};
+  const auto output_ptrs = CollectLikelyOutputPointers(args8);
+  if (!output_ptrs.empty()) {
+    WriteGuestU32(output_ptrs[0], connected ? 1u : 0u);
+  }
+  LogNui(
+      "XamNuiGetLoadedDepthCalibration({:08X}, {:08X}, {:08X}, {:08X}) -> {}",
+      args[0], args[1], args[2], args[3],
+      connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiGetLoadedDepthCalibration, kNone, kImplemented);
+
+dword_result_t XamNuiSetForceDeviceOff_entry(dword_t force_off) {
+  const bool off = force_off != 0;
+  nui_force_device_off.store(off, std::memory_order_relaxed);
+  LogNui("XamNuiSetForceDeviceOff({})", off ? "1" : "0");
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiSetForceDeviceOff, kNone, kImplemented);
+
+dword_result_t XamNuiEnableChatMic_entry(int_t enable) {
+  cvars::nui_chat_mic_enabled = enable != 0;
+  LogNui("XamNuiEnableChatMic(enable={}) -> {}", int32_t(enable),
+         cvars::nui_chat_mic_enabled ? "enabled" : "disabled");
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiEnableChatMic, kNone, kImplemented);
+
 qword_result_t XamNuiSkeletonGetBestSkeletonIndex_entry(int_t unk) {
   const bool tracked = IsNuiSkeletonTracked();
   LogNui("XamNuiSkeletonGetBestSkeletonIndex(unk={:08X}) -> {}",
@@ -1691,9 +1944,12 @@ dword_result_t XamNuiGetTrueColorInfo_entry(
   uint32_t height =
       uint32_t(std::clamp(cvars::nui_sensor_color_output_height, 16, 1080));
   uint32_t frame_index = 0;
+  uint32_t format_fourcc =
+      uint32_t(std::max(cvars::nui_sensor_color_format_fourcc, 0));
   const bool has_color = connected &&
                          UpdateNuiColorTextureFromSensor(&texture_ptr, &width, &height,
-                                                         &frame_index);
+                                                         &frame_index,
+                                                         &format_fourcc);
   const auto output_ptrs = CollectLikelyOutputPointers(args);
   if (!output_ptrs.empty()) {
     WriteGuestU32(output_ptrs[0], width);
@@ -1706,8 +1962,7 @@ dword_result_t XamNuiGetTrueColorInfo_entry(
                   uint32_t(std::max(cvars::nui_sensor_color_nominal_fps, 1)));
   }
   if (output_ptrs.size() > 3) {
-    WriteGuestU32(output_ptrs[3],
-                  uint32_t(std::max(cvars::nui_sensor_color_format_fourcc, 0)));
+    WriteGuestU32(output_ptrs[3], format_fourcc);
   }
   if (output_ptrs.size() > 4) {
     WriteGuestU32(output_ptrs[4], texture_ptr);
@@ -1717,8 +1972,7 @@ dword_result_t XamNuiGetTrueColorInfo_entry(
       args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
       connected ? "yes" : "no", has_color ? "yes" : "no", width, height,
       uint32_t(std::max(cvars::nui_sensor_color_nominal_fps, 1)),
-      uint32_t(std::max(cvars::nui_sensor_color_format_fourcc, 0)), texture_ptr,
-      frame_index);
+      format_fourcc, texture_ptr, frame_index);
   return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
 }
 DECLARE_XAM_EXPORT1(XamNuiGetTrueColorInfo, kNone, kImplemented);
@@ -1777,7 +2031,7 @@ dword_result_t XamNuiIdentityGetColorTexture_entry(
   uint32_t frame_index = 0;
   const bool has_color = connected &&
                          UpdateNuiColorTextureFromSensor(&texture_ptr, &width, &height,
-                                                         &frame_index);
+                                                         &frame_index, nullptr);
   const auto output_ptrs = CollectLikelyOutputPointers(args);
   if (!output_ptrs.empty()) {
     WriteGuestU32(output_ptrs[0], texture_ptr);
@@ -1810,7 +2064,7 @@ dword_result_t XamNuiNatalCameraUpdateStarting_entry(
   uint32_t frame_index = 0;
   const bool has_color = connected &&
                          UpdateNuiColorTextureFromSensor(&texture_ptr, &width, &height,
-                                                         &frame_index);
+                                                         &frame_index, nullptr);
   LogNui(
       "XamNuiNatalCameraUpdateStarting(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} color={} tex={:08X} wh={}x{} frame={}",
       uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
@@ -1831,7 +2085,7 @@ dword_result_t XamNuiNatalCameraUpdateComplete_entry(
   uint32_t frame_index = 0;
   const bool has_color = connected &&
                          UpdateNuiColorTextureFromSensor(&texture_ptr, &width, &height,
-                                                         &frame_index);
+                                                         &frame_index, nullptr);
   LogNui(
       "XamNuiNatalCameraUpdateComplete(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} color={} tex={:08X} wh={}x{} frame={}",
       uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
@@ -1841,6 +2095,88 @@ dword_result_t XamNuiNatalCameraUpdateComplete_entry(
   return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
 }
 DECLARE_XAM_EXPORT1(XamNuiNatalCameraUpdateComplete, kNone, kImplemented);
+
+dword_result_t XamNuiCameraRememberFloor_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraRememberFloor({:08X}, {:08X}, {:08X}) -> {}",
+         uint32_t(arg0), uint32_t(arg1), uint32_t(arg2),
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraRememberFloor, kNone, kImplemented);
+
+dword_result_t XamNuiCameraTiltSetCallback_entry(
+    unknown_t callback, unknown_t context, unknown_t flags) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui(
+      "XamNuiCameraTiltSetCallback(cb={:08X}, ctx={:08X}, flags={:08X}) -> {}",
+      uint32_t(callback), uint32_t(context), uint32_t(flags),
+      connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraTiltSetCallback, kNone, kImplemented);
+
+dword_result_t XamNuiCameraTiltReportStatus_entry(unknown_t status, unknown_t unk) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraTiltReportStatus(status={:08X}, {:08X}) -> {}",
+         uint32_t(status), uint32_t(unk),
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraTiltReportStatus, kNone, kImplemented);
+
+dword_result_t XamNuiCameraAdjustTilt_entry(int_t direction, int_t magnitude) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraAdjustTilt(direction={}, magnitude={}) -> {}",
+         int32_t(direction), int32_t(magnitude),
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraAdjustTilt, kNone, kImplemented);
+
+dword_result_t XamNuiCameraElevationSetAngle_entry(int_t angle) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraElevationSetAngle(angle={}) -> {}",
+         int32_t(angle), connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationSetAngle, kNone, kImplemented);
+
+dword_result_t XamNuiCameraElevationAutoTilt_entry(dword_t enable) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraElevationAutoTilt(enable={}) -> {}",
+         uint32_t(enable), connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationAutoTilt, kNone, kImplemented);
+
+dword_result_t XamNuiCameraElevationReverseAutoTilt_entry(dword_t enable) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraElevationReverseAutoTilt(enable={}) -> {}",
+         uint32_t(enable), connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationReverseAutoTilt, kNone, kImplemented);
+
+dword_result_t XamNuiCameraElevationStopMovement_entry() {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraElevationStopMovement() -> {}",
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationStopMovement, kNone, kImplemented);
+
+dword_result_t XamNuiCameraElevationSetCallback_entry(
+    unknown_t callback, unknown_t context, unknown_t flags) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui(
+      "XamNuiCameraElevationSetCallback(cb={:08X}, ctx={:08X}, flags={:08X}) -> {}",
+      uint32_t(callback), uint32_t(context), uint32_t(flags),
+      connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiCameraElevationSetCallback, kNone, kImplemented);
 
 dword_result_t XamNuiCameraTiltGetStatus_entry(lpvoid_t unk) {
   const bool connected = IsNuiDeviceConnected();
@@ -1958,6 +2294,109 @@ void XamNuiHudGetVersions_entry(lpqword_t unk1, lpqword_t unk2) {
 }
 DECLARE_XAM_EXPORT1(XamNuiHudGetVersions, kNone, kImplemented);
 
+qword_result_t XamNuiHudGetEngagedEnrollmentIndex_entry() {
+  LogNui("XamNuiHudGetEngagedEnrollmentIndex() -> {:08X}",
+         engaged_enrollment_index);
+  return engaged_enrollment_index;
+}
+DECLARE_XAM_EXPORT1(XamNuiHudGetEngagedEnrollmentIndex, kNone, kImplemented);
+
+dword_result_t XamNuiHudEnableInputFilter_entry(dword_t enable) {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiHudEnableInputFilter(enable={}) -> {}", uint32_t(enable),
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiHudEnableInputFilter, kNone, kImplemented);
+
+dword_result_t XamNuiHudInterpretFrame_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  const bool connected = IsNuiDeviceConnected();
+  const bool tracked = IsNuiSkeletonTracked();
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestU32(output_ptrs[0], tracked ? 1u : 0u);
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], engaged_tracking_id);
+  }
+  LogNui(
+      "XamNuiHudInterpretFrame(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} tracked={}",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+      connected ? "yes" : "no", tracked ? "yes" : "no");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiHudInterpretFrame, kNone, kImplemented);
+
+dword_result_t XamNuiGetDeviceSerialNumber_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3), 0, 0, 0, 0};
+  const bool connected = IsNuiDeviceConnected();
+  static constexpr const char kSerial[] = "XNUI-EMU-0001";
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestBytes(output_ptrs[0], kSerial, sizeof(kSerial));
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], uint32_t(sizeof(kSerial) - 1));
+  }
+  LogNui(
+      "XamNuiGetDeviceSerialNumber({:08X}, {:08X}, {:08X}, {:08X}) -> connected={} serial={}",
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      connected ? "yes" : "no", kSerial);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiGetDeviceSerialNumber, kNone, kImplemented);
+
+dword_result_t XamNuiGetFanRate_entry(lpdword_t out_rate) {
+  const bool connected = IsNuiDeviceConnected();
+  if (out_rate) {
+    *out_rate = 0;
+  }
+  LogNui("XamNuiGetFanRate(ptr={:08X}) -> {}", out_rate.guest_address(),
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiGetFanRate, kNone, kImplemented);
+
+dword_result_t XamNuiGetSupportString_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3), 0, 0, 0, 0};
+  const bool connected = IsNuiDeviceConnected();
+  static constexpr const char kSupport[] = "Xenia Kinect Bridge RGB1";
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestBytes(output_ptrs[0], kSupport, sizeof(kSupport));
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], uint32_t(sizeof(kSupport) - 1));
+  }
+  LogNui(
+      "XamNuiGetSupportString({:08X}, {:08X}, {:08X}, {:08X}) -> connected={} support={}",
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      connected ? "yes" : "no", kSupport);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiGetSupportString, kNone, kImplemented);
+
+dword_result_t XamNuiGetSystemGestureControl_entry(lpdword_t out_value) {
+  const bool connected = IsNuiDeviceConnected();
+  if (out_value) {
+    *out_value = nui_system_gesture_control;
+  }
+  LogNui("XamNuiGetSystemGestureControl(ptr={:08X}) -> {:08X}",
+         out_value.guest_address(), nui_system_gesture_control);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiGetSystemGestureControl, kNone, kImplemented);
+
 dword_result_t XamShowNuiTroubleshooterUI_entry(unknown_t unk1, unknown_t unk2,
                                                 unknown_t unk3) {
   LogNui("XamShowNuiTroubleshooterUI({:08X}, {:08X}, {:08X})", uint32_t(unk1),
@@ -2000,6 +2439,141 @@ dword_result_t XamShowNuiGuideUI_entry(unknown_t unk1, unknown_t unk2) {
   return XeXamNuiHudCheck(0);
 }
 DECLARE_XAM_EXPORT1(XamShowNuiGuideUI, kNone, kStub);
+
+dword_result_t XamNuiIdentityGetEnrollmentInfo_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  const bool connected = IsNuiDeviceConnected();
+  const bool tracked = IsNuiSkeletonTracked();
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestU32(output_ptrs[0], engaged_enrollment_index);
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], engaged_tracking_id);
+  }
+  if (output_ptrs.size() > 2) {
+    WriteGuestU32(output_ptrs[2], tracked ? 1u : 0u);
+  }
+  if (output_ptrs.size() > 3) {
+    WriteGuestU32(output_ptrs[3], connected ? 1u : 0u);
+  }
+  LogNui(
+      "XamNuiIdentityGetEnrollmentInfo(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} tracked={} enrollment={} tracking_id={:08X}",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+      connected ? "yes" : "no", tracked ? "yes" : "no",
+      engaged_enrollment_index, engaged_tracking_id);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiIdentityGetEnrollmentInfo, kNone, kImplemented);
+
+dword_result_t XamNuiIdentityUnenroll_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  const bool connected = IsNuiDeviceConnected();
+  engaged_enrollment_index = 0;
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestU32(output_ptrs[0], connected ? 1u : 0u);
+  }
+  LogNui(
+      "XamNuiIdentityUnenroll(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> {}",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+      connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiIdentityUnenroll, kNone, kImplemented);
+
+dword_result_t XamNuiIdentityGetQualityFlags_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  const bool connected = IsNuiDeviceConnected();
+  const bool tracked = IsNuiSkeletonTracked();
+  const uint32_t quality_flags = tracked ? 0u : 1u;
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestU32(output_ptrs[0], quality_flags);
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], tracked ? 1u : 0u);
+  }
+  LogNui(
+      "XamNuiIdentityGetQualityFlags(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} tracked={} flags={:08X}",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+      connected ? "yes" : "no", tracked ? "yes" : "no", quality_flags);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiIdentityGetQualityFlags, kNone, kImplemented);
+
+dword_result_t XamNuiIdentityGetQualityFlagsMessage_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  const bool connected = IsNuiDeviceConnected();
+  const bool tracked = IsNuiSkeletonTracked();
+  const char* message = tracked ? "tracking-ok" : "tracking-searching";
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestBytes(output_ptrs[0], message, std::strlen(message) + 1);
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], uint32_t(std::strlen(message)));
+  }
+  if (output_ptrs.size() > 2) {
+    WriteGuestU32(output_ptrs[2], tracked ? 0u : 1u);
+  }
+  LogNui(
+      "XamNuiIdentityGetQualityFlagsMessage(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} tracked={} msg={}",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+      connected ? "yes" : "no", tracked ? "yes" : "no", message);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiIdentityGetQualityFlagsMessage, kNone, kImplemented);
+
+dword_result_t XamNuiIdentityIdentifyWithBiometric_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  const bool connected = IsNuiDeviceConnected();
+  const bool tracked = IsNuiSkeletonTracked();
+  if (tracked && !engaged_tracking_id) {
+    engaged_tracking_id = 1;
+  }
+  const auto output_ptrs = CollectLikelyOutputPointers(args);
+  if (!output_ptrs.empty()) {
+    WriteGuestU32(output_ptrs[0], tracked ? 0u : 0xFFFFFFFFu);
+  }
+  if (output_ptrs.size() > 1) {
+    WriteGuestU32(output_ptrs[1], engaged_tracking_id);
+  }
+  if (output_ptrs.size() > 2) {
+    WriteGuestU32(output_ptrs[2], tracked ? 1u : 0u);
+  }
+  LogNui(
+      "XamNuiIdentityIdentifyWithBiometric(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]) -> connected={} tracked={} tracking_id={:08X}",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7],
+      connected ? "yes" : "no", tracked ? "yes" : "no", engaged_tracking_id);
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+}
+DECLARE_XAM_EXPORT1(XamNuiIdentityIdentifyWithBiometric, kNone, kImplemented);
 
 qword_result_t XamNuiIdentityGetSessionId_entry() {
   if (!nui_session_id) {

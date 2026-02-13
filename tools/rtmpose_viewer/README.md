@@ -52,12 +52,19 @@ Run viewer with UDP output enabled:
 python rtmpose_viewer.py --source 0 --mode balanced --nui-udp-target 127.0.0.1:37100
 ```
 
-To also send an RGB camera stream (downscaled RGB24 extension in the same UDP
-packet) for NUI camera APIs:
+RGB camera extension is enabled by default (downscaled RGB24 extension in the
+same UDP packet). To tune resolution/fps:
 
 ```bash
 python rtmpose_viewer.py --source 0 --mode balanced --nui-udp-target 127.0.0.1:37100 \
-  --nui-rgb-stream --nui-rgb-width 160 --nui-rgb-height 120 --nui-rgb-fps 15
+  --nui-rgb-width 160 --nui-rgb-height 120 --nui-rgb-fps 15
+```
+
+To disable RGB extension entirely:
+
+```bash
+python rtmpose_viewer.py --source 0 --mode balanced --nui-udp-target 127.0.0.1:37100 \
+  --no-nui-rgb-stream
 ```
 
 Depth-model tuning (recommended for gesture-heavy titles):
