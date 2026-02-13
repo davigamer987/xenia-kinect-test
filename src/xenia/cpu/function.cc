@@ -9,12 +9,28 @@
 
 #include "xenia/cpu/function.h"
 
+#include <atomic>
+
 #include "xenia/base/logging.h"
 #include "xenia/cpu/symbol.h"
 #include "xenia/cpu/thread_state.h"
 
 namespace xe {
 namespace cpu {
+
+namespace {
+
+std::atomic<ExternCallTraceHook> g_extern_call_trace_hook = nullptr;
+
+}  // namespace
+
+void SetExternCallTraceHook(ExternCallTraceHook hook) {
+  g_extern_call_trace_hook.store(hook, std::memory_order_relaxed);
+}
+
+ExternCallTraceHook GetExternCallTraceHook() {
+  return g_extern_call_trace_hook.load(std::memory_order_relaxed);
+}
 
 Function::Function(Module* module, uint32_t address)
     : Symbol(Symbol::Type::kFunction, module, address) {}

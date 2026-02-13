@@ -496,6 +496,9 @@ void X64Emitter::CallIndirect(const hir::Instr* instr,
 
 uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   auto function = reinterpret_cast<Function*>(function_ptr);
+  if (auto trace_hook = GetExternCallTraceHook()) {
+    trace_hook(function, true);
+  }
   if (!cvars::ignore_undefined_externs) {
     xe::FatalError(fmt::format("undefined extern call to {:08X} {}",
                                function->address(), function->name().c_str()));
@@ -506,6 +509,9 @@ uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   return 0;
 }
 void X64Emitter::CallExtern(const hir::Instr* instr, const Function* function) {
+  if (auto trace_hook = GetExternCallTraceHook()) {
+    trace_hook(function, false);
+  }
   bool undefined = true;
   if (function->behavior() == Function::Behavior::kBuiltin) {
     auto builtin_function = static_cast<const BuiltinFunction*>(function);

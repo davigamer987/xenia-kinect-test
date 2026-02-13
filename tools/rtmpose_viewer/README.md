@@ -92,6 +92,13 @@ To persist the same NUI/XAM call log to a separate file:
 --nui_sensor_log_path=/tmp/xenia_nui_calls.log
 ```
 
+To include generic `xam.xex` extern dispatches that look Kinect-related
+(`NUI`/`Natal` and undefined `__xam_...` call targets) in that same log:
+
+```bash
+--nui_trace_all_xam_import_calls=true
+```
+
 If a title uses a different argument index for `XamNuiSkeletonScoreUpdate`
 output buffers, adjust:
 

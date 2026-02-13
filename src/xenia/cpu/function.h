@@ -22,9 +22,11 @@
 namespace xe {
 namespace cpu {
 class Export;
-}  // namespace cpu
+class Function;
 
-namespace cpu {
+using ExternCallTraceHook = void (*)(const Function* function, bool undefined);
+void SetExternCallTraceHook(ExternCallTraceHook hook);
+ExternCallTraceHook GetExternCallTraceHook();
 
 struct SourceMapEntry {
   uint32_t guest_address;  // PPC guest address (0x82....).

@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <deque>
 #include <cstddef>
@@ -24,6 +25,8 @@
 #include <vector>
 
 #include "third_party/imgui/imgui.h"
+#include "xenia/cpu/function.h"
+#include "xenia/cpu/module.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/threading.h"
@@ -94,6 +97,24 @@ DEFINE_int32(
     nui_skeleton_score_output_arg_index, 1,
     "Argument index treated as an output frame pointer in "
     "XamNuiSkeletonScoreUpdate (-1 disables writing).",
+    "Kernel");
+DEFINE_int32(
+    nui_device_status_value, 1,
+    "Connected status value reported by XamNuiGetDeviceStatus.",
+    "Kernel");
+DEFINE_int32(
+    nui_hud_initialize_flags, 0x9,
+    "Initialize flags reported by XamNuiHudGetInitializeFlags (default enables "
+    "depth + skeleton style paths).",
+    "Kernel");
+DEFINE_bool(
+    nui_chat_mic_enabled, false,
+    "Reported return value for XamNuiIsChatMicEnabled.",
+    "Kernel");
+DEFINE_bool(
+    nui_trace_all_xam_import_calls, true,
+    "Trace all xam extern dispatches that look Kinect-related (NUI/Natal) "
+    "and append them to the Kinect NUI log.",
     "Kernel");
 DEFINE_double(
     nui_skeleton_torso_baseline_z_m, 2.0,
@@ -256,6 +277,39 @@ std::filesystem::path g_nui_log_file_path;
 FILE* g_nui_log_file = nullptr;
 bool g_nui_log_file_open_failed = false;
 
+bool ContainsNoCase(const std::string_view text, const std::string_view needle) {
+  if (needle.empty()) {
+    return true;
+  }
+  if (needle.size() > text.size()) {
+    return false;
+  }
+  for (size_t i = 0; i + needle.size() <= text.size(); ++i) {
+    bool matched = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      const unsigned char a = unsigned(text[i + j]);
+      const unsigned char b = unsigned(needle[j]);
+      if (std::tolower(a) != std::tolower(b)) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool IsXamModuleName(const std::string_view name) {
+  return ContainsNoCase(name, "xam.xex");
+}
+
+bool LooksLikeKinectCall(const std::string_view name) {
+  return ContainsNoCase(name, "nui") || ContainsNoCase(name, "natal") ||
+         ContainsNoCase(name, "kinect");
+}
+
 void CloseNuiLogFileLocked() {
   if (!g_nui_log_file) {
     return;
@@ -319,6 +373,24 @@ void AddNuiLogLine(const std::string& message) {
   if (cvars::log_kinect_nui_calls) {
     XELOGI("NUI: {}", message);
   }
+}
+
+void TraceXamExternCall(const xe::cpu::Function* function, bool undefined) {
+  if (!cvars::nui_trace_all_xam_import_calls || !function) {
+    return;
+  }
+  const xe::cpu::Module* module = function->module();
+  if (!module || !IsXamModuleName(module->name())) {
+    return;
+  }
+  const std::string_view function_name = function->name();
+  const bool unknown_xam = undefined && ContainsNoCase(function_name, "__xam_");
+  if (!LooksLikeKinectCall(function_name) && !unknown_xam) {
+    return;
+  }
+  AddNuiLogLine(fmt::format("XAM extern {}: {} @ {:08X}",
+                            undefined ? "undefined" : "dispatch",
+                            function_name, function->address()));
 }
 
 template <typename... Args>
@@ -660,6 +732,7 @@ class NuiUdpSensorService {
   ~NuiUdpSensorService() { Shutdown(); }
 
   void EnsureRunning() {
+    EnsureExternCallHook();
     EnsureDebugOverlayRegistered();
     if (!cvars::nui_sensor_udp_enabled) {
       return;
@@ -717,6 +790,19 @@ class NuiUdpSensorService {
   }
 
  private:
+  void EnsureExternCallHook() {
+    const auto current_hook = xe::cpu::GetExternCallTraceHook();
+    if (cvars::nui_trace_all_xam_import_calls) {
+      if (current_hook != &TraceXamExternCall) {
+        xe::cpu::SetExternCallTraceHook(&TraceXamExternCall);
+        AddNuiLogLine("Enabled XAM extern Kinect call tracing hook");
+      }
+    } else if (current_hook == &TraceXamExternCall) {
+      xe::cpu::SetExternCallTraceHook(nullptr);
+      AddNuiLogLine("Disabled XAM extern Kinect call tracing hook");
+    }
+  }
+
   void EnsureDebugOverlayRegistered() {
     if ((!cvars::show_kinect_debug && !cvars::show_kinect_nui_log) ||
         cvars::headless) {
@@ -923,6 +1009,10 @@ class NuiUdpSensorService {
   }
 
   void Shutdown() {
+    if (xe::cpu::GetExternCallTraceHook() == &TraceXamExternCall) {
+      xe::cpu::SetExternCallTraceHook(nullptr);
+      AddNuiLogLine("Disabled XAM extern Kinect call tracing hook");
+    }
     if (!started_.load(std::memory_order_relaxed)) {
       return;
     }
@@ -1169,10 +1259,20 @@ dword_result_t XamNuiGetDeviceStatus_entry(
     return X_E_INVALIDARG;
   }
   const bool connected = IsNuiDeviceConnected();
+  const uint32_t status_value =
+      connected ? uint32_t(std::max(cvars::nui_device_status_value, 1)) : 0u;
   status_ptr.Zero();
-  status_ptr->status = connected ? 1u : 0u;
-  LogNui("XamNuiGetDeviceStatus(status_ptr={:08X}) -> connected={}",
-         status_ptr.guest_address(), connected ? "yes" : "no");
+  status_ptr->unk0 = status_value;
+  status_ptr->unk1 = connected ? 1u : 0u;
+  status_ptr->unk2 = connected ? 1u : 0u;
+  status_ptr->status = status_value;
+  status_ptr->unk4 = connected ? 1u : 0u;
+  LogNui(
+      "XamNuiGetDeviceStatus(status_ptr={:08X}) -> connected={} fields=[{:08X},{:08X},{:08X},{:08X},{:08X}]",
+      status_ptr.guest_address(), connected ? "yes" : "no",
+      uint32_t(status_ptr->unk0), uint32_t(status_ptr->unk1),
+      uint32_t(status_ptr->unk2), uint32_t(status_ptr->status),
+      uint32_t(status_ptr->unk4));
   return connected ? X_ERROR_SUCCESS : 0xC0050006;
 }
 DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kStub);
@@ -1229,9 +1329,13 @@ dword_result_t XamUserNuiGetUserIndexForBind_entry(lpdword_t index) {
 DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndexForBind, kNone, kImplemented);
 
 dword_result_t XamNuiGetDepthCalibration_entry(lpdword_t unk1) {
-  LogNui("XamNuiGetDepthCalibration(ptr={:08X}) -> not found",
-         unk1.guest_address());
-  return X_STATUS_NO_SUCH_FILE;
+  const bool connected = IsNuiDeviceConnected();
+  if (unk1) {
+    *unk1 = connected ? 1u : 0u;
+  }
+  LogNui("XamNuiGetDepthCalibration(ptr={:08X}) -> {}",
+         unk1.guest_address(), connected ? "success" : "not found");
+  return connected ? X_ERROR_SUCCESS : X_STATUS_NO_SUCH_FILE;
 }
 DECLARE_XAM_EXPORT1(XamNuiGetDepthCalibration, kNone, kStub);
 
@@ -1309,29 +1413,44 @@ dword_result_t XamNuiSkeletonScoreUpdate_entry(
 DECLARE_XAM_EXPORT1(XamNuiSkeletonScoreUpdate, kNone, kImplemented);
 
 dword_result_t XamNuiCameraTiltGetStatus_entry(lpvoid_t unk) {
-  return IsNuiDeviceConnected() ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraTiltGetStatus(ptr={:08X}) -> {}",
+         unk.guest_address(), connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraTiltGetStatus, kNone, kStub);
 
 dword_result_t XamNuiCameraElevationGetAngle_entry(lpqword_t angle,
                                                    lpdword_t status) {
+  const bool connected = IsNuiDeviceConnected();
   if (angle) {
     *angle = 0;
   }
   if (status) {
     *status = 0;
   }
-  return IsNuiDeviceConnected() ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+  LogNui(
+      "XamNuiCameraElevationGetAngle(angle_ptr={:08X}, status_ptr={:08X}) -> {}",
+      angle.guest_address(), status.guest_address(),
+      connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraElevationGetAngle, kNone, kStub);
 
 dword_result_t XamNuiCameraGetTiltControllerType_entry() {
-  return IsNuiDeviceConnected() ? 1u : 0u;
+  const bool connected = IsNuiDeviceConnected();
+  const uint32_t result = connected ? 1u : 0u;
+  LogNui("XamNuiCameraGetTiltControllerType() -> {:08X}", result);
+  return result;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraGetTiltControllerType, kNone, kStub);
 
 dword_result_t XamNuiCameraSetFlags_entry(qword_t unk1, dword_t unk2) {
-  return IsNuiDeviceConnected() ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiCameraSetFlags({:016X}, {:08X}) -> {}",
+         uint64_t(unk1), uint32_t(unk2),
+         connected ? "success" : "not-connected");
+  return connected ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
 }
 DECLARE_XAM_EXPORT1(XamNuiCameraSetFlags, kNone, kStub);
 
@@ -1346,16 +1465,24 @@ dword_result_t XamNuiIsDeviceReady_entry() {
 DECLARE_XAM_EXPORT1(XamNuiIsDeviceReady, kNone, kImplemented);
 
 dword_result_t XamIsNuiAutomationEnabled_entry(unknown_t unk1, unknown_t unk2) {
+  LogNui("XamIsNuiAutomationEnabled({:08X}, {:08X}) -> success",
+         uint32_t(unk1), uint32_t(unk2));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT2(XamIsNuiAutomationEnabled, kNone, kStub, kHighFrequency);
 
 dword_result_t XamIsNatalPlaybackEnabled_entry(unknown_t unk1, unknown_t unk2) {
+  LogNui("XamIsNatalPlaybackEnabled({:08X}, {:08X}) -> success",
+         uint32_t(unk1), uint32_t(unk2));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT2(XamIsNatalPlaybackEnabled, kNone, kStub, kHighFrequency);
 
-dword_result_t XamNuiIsChatMicEnabled_entry() { return false; }
+dword_result_t XamNuiIsChatMicEnabled_entry() {
+  LogNui("XamNuiIsChatMicEnabled() -> {}", cvars::nui_chat_mic_enabled ? "1"
+                                                                        : "0");
+  return cvars::nui_chat_mic_enabled ? 1u : 0u;
+}
 DECLARE_XAM_EXPORT1(XamNuiIsChatMicEnabled, kNone, kImplemented);
 
 dword_result_t XamNuiHudSetEngagedTrackingID_entry(dword_t tracking_id) {
@@ -1371,19 +1498,33 @@ qword_result_t XamNuiHudGetEngagedTrackingID_entry() {
 }
 DECLARE_XAM_EXPORT1(XamNuiHudGetEngagedTrackingID, kNone, kImplemented);
 
-dword_result_t XamNuiHudIsEnabled_entry() { return IsNuiDeviceConnected(); }
+dword_result_t XamNuiHudIsEnabled_entry() {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiHudIsEnabled() -> {}", connected ? "1" : "0");
+  return connected ? 1u : 0u;
+}
 DECLARE_XAM_EXPORT1(XamNuiHudIsEnabled, kNone, kImplemented);
 
-dword_result_t XamNuiHudGetInitializeFlags_entry() { return 0; }
+dword_result_t XamNuiHudGetInitializeFlags_entry() {
+  const bool connected = IsNuiDeviceConnected();
+  const uint32_t flags =
+      connected ? uint32_t(std::max(cvars::nui_hud_initialize_flags, 0)) : 0u;
+  LogNui("XamNuiHudGetInitializeFlags() -> {:08X}", flags);
+  return flags;
+}
 DECLARE_XAM_EXPORT1(XamNuiHudGetInitializeFlags, kNone, kImplemented);
 
 void XamNuiHudGetVersions_entry(lpqword_t unk1, lpqword_t unk2) {
+  const bool connected = IsNuiDeviceConnected();
+  const uint64_t version = connected ? 0x0001000000000000ull : 0ull;
   if (unk1) {
-    *unk1 = 0;
+    *unk1 = version;
   }
   if (unk2) {
-    *unk2 = 0;
+    *unk2 = version;
   }
+  LogNui("XamNuiHudGetVersions(ptr1={:08X}, ptr2={:08X}) -> {:016X}",
+         unk1.guest_address(), unk2.guest_address(), version);
 }
 DECLARE_XAM_EXPORT1(XamNuiHudGetVersions, kNone, kImplemented);
 
@@ -1425,6 +1566,7 @@ dword_result_t XamShowNuiHardwareRequiredUI_entry(unknown_t unk1) {
 DECLARE_XAM_EXPORT1(XamShowNuiHardwareRequiredUI, kNone, kImplemented);
 
 dword_result_t XamShowNuiGuideUI_entry(unknown_t unk1, unknown_t unk2) {
+  LogNui("XamShowNuiGuideUI({:08X}, {:08X})", uint32_t(unk1), uint32_t(unk2));
   return XeXamNuiHudCheck(0);
 }
 DECLARE_XAM_EXPORT1(XamShowNuiGuideUI, kNone, kStub);
@@ -1433,29 +1575,47 @@ qword_result_t XamNuiIdentityGetSessionId_entry() {
   if (!nui_session_id) {
     nui_session_id = 0xDEADF00DDEADF00Dull;
   }
+  LogNui("XamNuiIdentityGetSessionId() -> {:016X}", nui_session_id);
   return nui_session_id;
 }
 DECLARE_XAM_EXPORT1(XamNuiIdentityGetSessionId, kNone, kImplemented);
 
 dword_result_t XamNuiIdentityEnrollForSignIn_entry(dword_t unk1, qword_t unk2,
                                                    qword_t unk3, dword_t unk4) {
-  return XamNuiHudIsEnabled_entry() ? X_ERROR_SUCCESS : X_E_FAIL;
+  const bool enabled = XamNuiHudIsEnabled_entry() != 0;
+  LogNui(
+      "XamNuiIdentityEnrollForSignIn({:08X}, {:016X}, {:016X}, {:08X}) -> {}",
+      uint32_t(unk1), uint64_t(unk2), uint64_t(unk3), uint32_t(unk4),
+      enabled ? "success" : "fail");
+  return enabled ? X_ERROR_SUCCESS : X_E_FAIL;
 }
 DECLARE_XAM_EXPORT1(XamNuiIdentityEnrollForSignIn, kNone, kStub);
 
 dword_result_t XamNuiIdentityAbort_entry(dword_t unk) {
-  return XamNuiHudIsEnabled_entry() ? X_ERROR_SUCCESS : X_E_FAIL;
+  const bool enabled = XamNuiHudIsEnabled_entry() != 0;
+  LogNui("XamNuiIdentityAbort({:08X}) -> {}", uint32_t(unk),
+         enabled ? "success" : "fail");
+  return enabled ? X_ERROR_SUCCESS : X_E_FAIL;
 }
 DECLARE_XAM_EXPORT1(XamNuiIdentityAbort, kNone, kStub);
 
 dword_result_t XamUserNuiEnableBiometric_entry(dword_t user_index,
                                                int_t enable) {
-  return X_E_INVALIDARG;
+  const bool connected = IsNuiDeviceConnected();
+  const bool valid_user = user_index == 0;
+  const uint32_t result =
+      (connected && valid_user) ? X_ERROR_SUCCESS : X_E_NO_SUCH_USER;
+  LogNui("XamUserNuiEnableBiometric(user_index={}, enable={}) -> {:08X}",
+         uint32_t(user_index), int32_t(enable), result);
+  return result;
 }
 DECLARE_XAM_EXPORT1(XamUserNuiEnableBiometric, kNone, kStub);
 
 void XamNuiPlayerEngagementUpdate_entry(qword_t unk1, unknown_t unk2,
-                                        lpunknown_t unk3) {}
+                                        lpunknown_t unk3) {
+  LogNui("XamNuiPlayerEngagementUpdate({:016X}, {:08X}, ptr={:08X})",
+         uint64_t(unk1), uint32_t(unk2), unk3.guest_address());
+}
 DECLARE_XAM_EXPORT1(XamNuiPlayerEngagementUpdate, kNone, kStub);
 
 }  // namespace xam
