@@ -26,7 +26,16 @@ jobs:
 
       - name: Build xenia-app (Checked)
         shell: pwsh
-        run: py -3 .\xenia-build build --config checked -j $env:NUMBER_OF_PROCESSORS
+        run: py -3 .\xenia-build build --config checked -j $env:NUMBER_OF_PROCESSORS -- /v:detailed /bl:msbuild.binlog
+
+      - name: Upload MSBuild binlog
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenia-windows-msbuild-binlog
+          path: msbuild.binlog
+          if-no-files-found: ignore
+          retention-days: 14
 
       - name: Upload Checked binaries
         uses: actions/upload-artifact@v4
