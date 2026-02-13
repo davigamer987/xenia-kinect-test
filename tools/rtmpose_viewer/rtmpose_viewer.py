@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import math
 import os
 from pathlib import Path
 import socket
@@ -82,12 +83,190 @@ def parse_udp_target(raw_target: str) -> tuple[str, int]:
     return host, port
 
 
+class NuiDepthEstimator:
+    """Calibrated depth model for COCO-17 joints from monocular 2D pose."""
+
+    def __init__(
+        self,
+        torso_z_baseline: float,
+        z_min: float,
+        z_max: float,
+        smoothing: float,
+        assumed_shoulder_width_m: float,
+        assumed_height_m: float,
+        camera_fov_deg: float,
+        focal_length_px: float,
+        upper_arm_length_m: float,
+        forearm_length_m: float,
+    ) -> None:
+        self.torso_z_baseline = max(float(torso_z_baseline), 0.1)
+        self.z_min = max(float(z_min), 0.1)
+        self.z_max = max(float(z_max), self.z_min + 0.1)
+        self.smoothing = self._clamp(float(smoothing), 0.0, 1.0)
+        self.assumed_shoulder_width_m = max(float(assumed_shoulder_width_m), 0.1)
+        self.assumed_height_m = max(float(assumed_height_m), 0.8)
+        self.camera_fov_deg = self._clamp(float(camera_fov_deg), 30.0, 140.0)
+        self.focal_length_px = max(float(focal_length_px), 0.0)
+        self.upper_arm_length_m = max(float(upper_arm_length_m), 0.05)
+        self.forearm_length_m = max(float(forearm_length_m), 0.05)
+        self._smoothed_torso_z = self.torso_z_baseline
+        self._torso_initialized = False
+        self._smoothed_depths = [self.torso_z_baseline] * 32
+        self._initialized = [False] * 32
+
+    @staticmethod
+    def _clamp(value: float, low: float, high: float) -> float:
+        return max(low, min(high, value))
+
+    @staticmethod
+    def _distance(a: tuple[float, float, float], b: tuple[float, float, float]) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    @staticmethod
+    def _joint(
+        keypoints: Any,
+        scores: Any,
+        index: int,
+    ) -> tuple[float, float, float] | None:
+        if index >= len(keypoints) or index >= len(scores):
+            return None
+        return float(keypoints[index][0]), float(keypoints[index][1]), float(scores[index])
+
+    def _focal_px(self, frame_width: int) -> float:
+        if self.focal_length_px > 1.0:
+            return self.focal_length_px
+        fov_rad = math.radians(self.camera_fov_deg)
+        return (float(frame_width) * 0.5) / max(math.tan(fov_rad * 0.5), 1e-6)
+
+    def _estimate_torso_z(
+        self,
+        keypoints: Any,
+        scores: Any,
+        frame_width: int,
+        confidence_floor: float,
+    ) -> float:
+        f_px = self._focal_px(frame_width)
+        anchors: list[tuple[float, float]] = []
+
+        left_shoulder = self._joint(keypoints, scores, 5)
+        right_shoulder = self._joint(keypoints, scores, 6)
+        if left_shoulder and right_shoulder:
+            shoulder_conf = min(left_shoulder[2], right_shoulder[2])
+            shoulder_px = self._distance(left_shoulder, right_shoulder)
+            if shoulder_conf >= confidence_floor and shoulder_px >= 12.0:
+                z_shoulder = f_px * self.assumed_shoulder_width_m / max(shoulder_px, 1e-6)
+                anchors.append((z_shoulder, shoulder_conf))
+
+        nose = self._joint(keypoints, scores, 0)
+        left_ankle = self._joint(keypoints, scores, 15)
+        right_ankle = self._joint(keypoints, scores, 16)
+        ankle_samples = [j for j in (left_ankle, right_ankle) if j and j[2] >= confidence_floor]
+        if nose and nose[2] >= confidence_floor and ankle_samples:
+            ankle_y = sum(j[1] for j in ankle_samples) / len(ankle_samples)
+            body_px = abs(ankle_y - nose[1])
+            if body_px >= 40.0:
+                height_conf = min(nose[2], sum(j[2] for j in ankle_samples) / len(ankle_samples))
+                z_height = f_px * self.assumed_height_m / max(body_px, 1e-6)
+                anchors.append((z_height, height_conf * 0.7))
+
+        if not anchors:
+            torso_z = self.torso_z_baseline
+        else:
+            total_weight = sum(w for _, w in anchors)
+            if total_weight <= 1e-6:
+                torso_z = self.torso_z_baseline
+            else:
+                torso_z = sum(z * w for z, w in anchors) / total_weight
+
+        torso_z = self._clamp(torso_z, self.z_min, self.z_max)
+        if self._torso_initialized:
+            torso_z = self._smoothed_torso_z * (1.0 - self.smoothing) + torso_z * self.smoothing
+        self._smoothed_torso_z = torso_z
+        self._torso_initialized = True
+        return torso_z
+
+    def estimate(self, keypoints: Any, scores: Any, frame_width: int, frame_height: int) -> list[float]:
+        joint_count = min(len(keypoints), len(scores), 32)
+        if joint_count <= 0:
+            return []
+
+        confidence_floor = 0.15
+        torso_z = self._estimate_torso_z(keypoints, scores, frame_width, confidence_floor)
+        f_px = self._focal_px(frame_width)
+
+        raw_depths = [torso_z] * joint_count
+
+        def set_depth(index: int, value: float) -> None:
+            if index < joint_count:
+                raw_depths[index] = value
+
+        set_depth(0, torso_z - 0.08)  # head / nose
+        for idx in (11, 12):
+            set_depth(idx, torso_z + 0.06)
+        for idx in (13, 14):
+            set_depth(idx, torso_z + 0.14)
+        for idx in (15, 16):
+            set_depth(idx, torso_z + 0.22)
+
+        def apply_arm_depth(shoulder_idx: int, elbow_idx: int, wrist_idx: int) -> None:
+            shoulder = self._joint(keypoints, scores, shoulder_idx)
+            elbow = self._joint(keypoints, scores, elbow_idx)
+            wrist = self._joint(keypoints, scores, wrist_idx)
+            if not shoulder or not wrist:
+                return
+            if shoulder[2] < confidence_floor or wrist[2] < confidence_floor:
+                return
+
+            confidence_gate = min(shoulder[2], wrist[2], 1.0)
+
+            def segment_forward(
+                a: tuple[float, float, float] | None,
+                b: tuple[float, float, float] | None,
+                length_m: float,
+            ) -> float:
+                if not a or not b:
+                    return 0.0
+                conf = min(a[2], b[2])
+                if conf < confidence_floor:
+                    return 0.0
+                projected_px = self._distance(a, b)
+                transverse_m = torso_z * projected_px / max(f_px, 1e-6)
+                transverse_m = min(transverse_m, length_m)
+                forward_m = math.sqrt(max(length_m * length_m - transverse_m * transverse_m, 0.0))
+                conf_scale = self._clamp((conf - confidence_floor) / 0.65, 0.0, 1.0)
+                return forward_m * conf_scale
+
+            upper_forward = segment_forward(shoulder, elbow, self.upper_arm_length_m)
+            fore_forward = segment_forward(elbow, wrist, self.forearm_length_m)
+            forward_total = upper_forward + fore_forward
+            confidence_scale = self._clamp((confidence_gate - confidence_floor) / 0.65, 0.0, 1.0)
+
+            if elbow_idx < joint_count:
+                raw_depths[elbow_idx] = torso_z - upper_forward
+            if wrist_idx < joint_count:
+                raw_depths[wrist_idx] = torso_z - forward_total * confidence_scale
+
+        apply_arm_depth(5, 7, 9)
+        apply_arm_depth(6, 8, 10)
+
+        smoothed_depths: list[float] = []
+        for i in range(joint_count):
+            depth = self._clamp(raw_depths[i], self.z_min, self.z_max)
+            if self._initialized[i]:
+                depth = self._smoothed_depths[i] * (1.0 - self.smoothing) + depth * self.smoothing
+            self._smoothed_depths[i] = depth
+            self._initialized[i] = True
+            smoothed_depths.append(depth)
+        return smoothed_depths
+
+
 def build_nui_udp_payload(
     frame: Any,
     keypoints: Any,
     scores: Any,
     frame_index: int,
     score_threshold: float,
+    depth_estimator: NuiDepthEstimator | None,
 ) -> bytes:
     frame_height, frame_width = frame.shape[:2]
 
@@ -109,6 +288,13 @@ def build_nui_udp_payload(
         player_keypoints = keypoints[best_player]
         player_scores = scores[best_player]
         joint_count = min(len(player_keypoints), len(player_scores), 32)
+        depth_meters = (
+            depth_estimator.estimate(
+                player_keypoints, player_scores, frame_width, frame_height
+            )
+            if depth_estimator is not None
+            else [2.0] * joint_count
+        )
         for i in range(joint_count):
             x_px = float(player_keypoints[i][0])
             y_px = float(player_keypoints[i][1])
@@ -117,7 +303,7 @@ def build_nui_udp_payload(
             # Normalize to a camera-like space.
             x_norm = (x_px / max(frame_width, 1)) * 2.0 - 1.0
             y_norm = 1.0 - (y_px / max(frame_height, 1)) * 2.0
-            z_norm = 1.0
+            z_norm = float(depth_meters[i]) if i < len(depth_meters) else 2.0
 
             if confidence >= score_threshold:
                 tracked_flag = 1
@@ -138,6 +324,11 @@ def build_nui_udp_payload(
 
     for x_norm, y_norm, z_norm, confidence in joint_tuples:
         payload.extend(struct.pack("<ffff", x_norm, y_norm, z_norm, confidence))
+
+    # Optional tail extension for consumers that need source aspect correction.
+    frame_width_u16 = max(0, min(int(frame_width), 0xFFFF))
+    frame_height_u16 = max(0, min(int(frame_height), 0xFFFF))
+    payload.extend(struct.pack("<HH", frame_width_u16, frame_height_u16))
 
     return bytes(payload)
 
@@ -333,11 +524,44 @@ def run_viewer(args: argparse.Namespace) -> int:
     writer = create_video_writer(args.output, capture) if args.output else None
     nui_socket: socket.socket | None = None
     nui_target: tuple[str, int] | None = None
+    nui_depth_estimator: NuiDepthEstimator | None = None
 
     if args.nui_udp_target:
         nui_target = parse_udp_target(args.nui_udp_target)
         nui_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        nui_depth_estimator = NuiDepthEstimator(
+            torso_z_baseline=args.nui_torso_z_baseline,
+            z_min=args.nui_z_min,
+            z_max=args.nui_z_max,
+            smoothing=args.nui_z_smoothing,
+            assumed_shoulder_width_m=args.nui_assumed_shoulder_width_m,
+            assumed_height_m=args.nui_assumed_height_m,
+            camera_fov_deg=args.nui_camera_fov_deg,
+            focal_length_px=args.nui_focal_length_px,
+            upper_arm_length_m=args.nui_upper_arm_length_m,
+            forearm_length_m=args.nui_forearm_length_m,
+        )
         print(f"NUI UDP streaming enabled: {nui_target[0]}:{nui_target[1]}")
+        print(
+            "NUI depth model enabled: "
+            f"torso_z={args.nui_torso_z_baseline:.2f}m "
+            f"range=[{args.nui_z_min:.2f},{args.nui_z_max:.2f}] "
+            f"smoothing={args.nui_z_smoothing:.2f}"
+        )
+        if args.nui_focal_length_px > 0:
+            print(
+                "NUI calibrated scale: "
+                f"focal_px={args.nui_focal_length_px:.1f} "
+                f"shoulder={args.nui_assumed_shoulder_width_m:.3f}m "
+                f"height={args.nui_assumed_height_m:.3f}m"
+            )
+        else:
+            print(
+                "NUI calibrated scale: "
+                f"fov={args.nui_camera_fov_deg:.1f}deg "
+                f"shoulder={args.nui_assumed_shoulder_width_m:.3f}m "
+                f"height={args.nui_assumed_height_m:.3f}m"
+            )
 
     frame_count = 0
     start_time = time.perf_counter()
@@ -369,7 +593,12 @@ def run_viewer(args: argparse.Namespace) -> int:
 
             if nui_socket is not None and nui_target is not None:
                 packet = build_nui_udp_payload(
-                    frame, keypoints, scores, frame_count, args.nui_score_thr
+                    frame,
+                    keypoints,
+                    scores,
+                    frame_count,
+                    args.nui_score_thr,
+                    nui_depth_estimator,
                 )
                 nui_socket.sendto(packet, nui_target)
 
@@ -460,6 +689,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Joint confidence threshold used to mark the outgoing NUI frame as tracked.",
     )
     parser.add_argument(
+        "--nui-torso-z-baseline",
+        type=float,
+        default=2.0,
+        help="Baseline torso depth in meters used by the outgoing NUI depth model.",
+    )
+    parser.add_argument(
+        "--nui-z-min",
+        type=float,
+        default=0.8,
+        help="Minimum outgoing NUI joint depth in meters.",
+    )
+    parser.add_argument(
+        "--nui-z-max",
+        type=float,
+        default=4.0,
+        help="Maximum outgoing NUI joint depth in meters.",
+    )
+    parser.add_argument(
+        "--nui-z-smoothing",
+        type=float,
+        default=0.35,
+        help="Depth smoothing factor for outgoing NUI joints (0=no smoothing, 1=no history).",
+    )
+    parser.add_argument(
+        "--nui-assumed-shoulder-width-m",
+        type=float,
+        default=0.41,
+        help="Assumed real shoulder width in meters for calibrated scale.",
+    )
+    parser.add_argument(
+        "--nui-assumed-height-m",
+        type=float,
+        default=1.70,
+        help="Assumed real body height in meters for secondary scale anchor.",
+    )
+    parser.add_argument(
+        "--nui-camera-fov-deg",
+        type=float,
+        default=70.0,
+        help="Horizontal camera field-of-view in degrees (used when focal length is not set).",
+    )
+    parser.add_argument(
+        "--nui-focal-length-px",
+        type=float,
+        default=0.0,
+        help="Optional calibrated focal length in pixels. If >0, overrides --nui-camera-fov-deg.",
+    )
+    parser.add_argument(
+        "--nui-upper-arm-length-m",
+        type=float,
+        default=0.30,
+        help="Assumed upper arm length in meters for relative hand-depth model.",
+    )
+    parser.add_argument(
+        "--nui-forearm-length-m",
+        type=float,
+        default=0.26,
+        help="Assumed forearm length in meters for relative hand-depth model.",
+    )
+    parser.add_argument(
         "--torch-home",
         default=None,
         help="Optional cache root for downloaded model files.",
@@ -469,6 +758,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.nui_z_min >= args.nui_z_max:
+        raise SystemExit("ERROR: --nui-z-min must be lower than --nui-z-max.")
 
     if args.torch_home:
         os.environ["TORCH_HOME"] = args.torch_home

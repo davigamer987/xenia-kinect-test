@@ -11,11 +11,16 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <deque>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/logging.h"
@@ -58,9 +63,47 @@ DEFINE_int32(nui_sensor_frame_timeout_ms, 500,
 DEFINE_double(nui_sensor_min_joint_confidence, 0.25,
               "Minimum joint confidence that marks a frame as tracked.",
               "Kernel");
+DEFINE_double(
+    nui_sensor_source_aspect_ratio, 4.0 / 3.0,
+    "Fallback RTMPose sender aspect ratio used by the Kinect debug overlay "
+    "when frame dimensions are unavailable.",
+    "Kernel");
 DEFINE_bool(
     show_kinect_debug, false,
     "Draw host-side Kinect debug overlay (joints, bones, FPS, latency).",
+    "Kernel");
+DEFINE_bool(
+    show_kinect_nui_log, false,
+    "Draw a dedicated Kinect NUI call log window in the host UI.",
+    "Kernel");
+DEFINE_bool(
+    log_kinect_nui_calls, true,
+    "Write Kinect/NUI bridge call details to xenia.log.",
+    "Kernel");
+DEFINE_int32(
+    nui_sensor_log_frame_interval, 30,
+    "How often to log received UDP skeleton frames (in frame count).",
+    "Kernel");
+DEFINE_int32(
+    nui_skeleton_score_output_arg_index, 1,
+    "Argument index treated as an output frame pointer in "
+    "XamNuiSkeletonScoreUpdate (-1 disables writing).",
+    "Kernel");
+DEFINE_double(
+    nui_skeleton_torso_baseline_z_m, 2.0,
+    "Fallback torso depth (meters) used when incoming joint depth is invalid.",
+    "Kernel");
+DEFINE_double(
+    nui_skeleton_min_depth_m, 0.8,
+    "Minimum accepted Kinect skeleton depth in meters.",
+    "Kernel");
+DEFINE_double(
+    nui_skeleton_max_depth_m, 4.0,
+    "Maximum accepted Kinect skeleton depth in meters.",
+    "Kernel");
+DEFINE_double(
+    nui_skeleton_depth_smoothing, 0.35,
+    "Depth smoothing factor for incoming Kinect joints (0=no smoothing, 1=no history).",
     "Kernel");
 
 namespace xe {
@@ -86,6 +129,7 @@ constexpr uint16_t kNuiUdpFrameVersion = 1;
 constexpr size_t kNuiUdpHeaderSize = 24;
 constexpr size_t kNuiUdpJointSize = 16;
 constexpr size_t kNuiMaxJoints = 32;
+constexpr size_t kNuiUdpFrameSizeTailSize = 4;
 
 struct NuiJoint {
   float x = 0.0f;
@@ -101,9 +145,122 @@ struct NuiDebugSnapshot {
   uint64_t sensor_timestamp_us = 0;
   uint64_t host_receive_us = 0;
   float receive_fps = 0.0f;
+  uint16_t frame_width = 0;
+  uint16_t frame_height = 0;
   uint16_t joint_count = 0;
   std::array<NuiJoint, kNuiMaxJoints> joints = {};
 };
+
+constexpr size_t kNuiLogLineLimit = 256;
+constexpr uint32_t kNuiSkeletonCount = 6;
+constexpr uint32_t kNuiSkeletonPositionCount = 20;
+
+enum NuiSkeletonTrackingState : uint32_t {
+  kNuiSkeletonNotTracked = 0,
+  kNuiSkeletonPositionOnly = 1,
+  kNuiSkeletonTracked = 2,
+};
+
+enum NuiSkeletonPositionTrackingState : uint32_t {
+  kNuiSkeletonPositionNotTracked = 0,
+  kNuiSkeletonPositionInferred = 1,
+  kNuiSkeletonPositionTracked = 2,
+};
+
+enum NuiSkeletonPositionIndex : uint32_t {
+  kNuiSkeletonPositionHipCenter = 0,
+  kNuiSkeletonPositionSpine = 1,
+  kNuiSkeletonPositionShoulderCenter = 2,
+  kNuiSkeletonPositionHead = 3,
+  kNuiSkeletonPositionShoulderLeft = 4,
+  kNuiSkeletonPositionElbowLeft = 5,
+  kNuiSkeletonPositionWristLeft = 6,
+  kNuiSkeletonPositionHandLeft = 7,
+  kNuiSkeletonPositionShoulderRight = 8,
+  kNuiSkeletonPositionElbowRight = 9,
+  kNuiSkeletonPositionWristRight = 10,
+  kNuiSkeletonPositionHandRight = 11,
+  kNuiSkeletonPositionHipLeft = 12,
+  kNuiSkeletonPositionKneeLeft = 13,
+  kNuiSkeletonPositionAnkleLeft = 14,
+  kNuiSkeletonPositionFootLeft = 15,
+  kNuiSkeletonPositionHipRight = 16,
+  kNuiSkeletonPositionKneeRight = 17,
+  kNuiSkeletonPositionAnkleRight = 18,
+  kNuiSkeletonPositionFootRight = 19,
+};
+
+struct X_NUI_VECTOR4 {
+  xe::be<float> x;
+  xe::be<float> y;
+  xe::be<float> z;
+  xe::be<float> w;
+};
+static_assert(sizeof(X_NUI_VECTOR4) == 16, "Size matters");
+
+struct X_NUI_SKELETON_DATA {
+  xe::be<uint32_t> tracking_state;
+  xe::be<uint32_t> tracking_id;
+  xe::be<uint32_t> enrollment_index;
+  xe::be<uint32_t> user_index;
+  X_NUI_VECTOR4 position;
+  std::array<X_NUI_VECTOR4, kNuiSkeletonPositionCount> joints;
+  std::array<xe::be<uint32_t>, kNuiSkeletonPositionCount> joint_states;
+  xe::be<uint32_t> quality_flags;
+};
+static_assert(sizeof(X_NUI_SKELETON_DATA) == 436, "Unexpected skeleton size");
+
+struct X_NUI_SKELETON_FRAME {
+  xe::be<uint64_t> timestamp;
+  xe::be<uint32_t> frame_number;
+  xe::be<uint32_t> flags;
+  X_NUI_VECTOR4 floor_clip_plane;
+  X_NUI_VECTOR4 normal_to_gravity;
+  std::array<X_NUI_SKELETON_DATA, kNuiSkeletonCount> skeletons;
+};
+static_assert(sizeof(X_NUI_SKELETON_FRAME) == 2664, "Unexpected frame size");
+
+struct NuiJointSample {
+  float x = 0.0f;
+  float y = 0.0f;
+  float z = 0.0f;
+  float confidence = 0.0f;
+  bool valid = false;
+};
+
+std::mutex g_nui_log_mutex;
+std::deque<std::string> g_nui_log_lines;
+std::atomic<uint64_t> g_nui_log_line_index = 0;
+
+void AddNuiLogLine(const std::string& message) {
+  const uint64_t line_index =
+      g_nui_log_line_index.fetch_add(1, std::memory_order_relaxed) + 1;
+  const std::string line = fmt::format("[{:06}] {}", line_index, message);
+  {
+    std::lock_guard<std::mutex> lock(g_nui_log_mutex);
+    g_nui_log_lines.emplace_back(line);
+    while (g_nui_log_lines.size() > kNuiLogLineLimit) {
+      g_nui_log_lines.pop_front();
+    }
+  }
+  if (cvars::log_kinect_nui_calls) {
+    XELOGI("NUI: {}", message);
+  }
+}
+
+template <typename... Args>
+void LogNui(const char* format, Args&&... args) {
+  AddNuiLogLine(fmt::format(format, std::forward<Args>(args)...));
+}
+
+bool IsLikelyGuestAddress(uint32_t guest_address) {
+  return guest_address != 0 && kernel_memory()->LookupHeap(guest_address);
+}
+
+std::vector<std::string> CopyNuiLogLines() {
+  std::lock_guard<std::mutex> lock(g_nui_log_mutex);
+  return std::vector<std::string>(g_nui_log_lines.begin(), g_nui_log_lines.end());
+}
 
 // COCO-17 style topology, compatible with the default RTMPose output.
 constexpr std::array<std::array<uint8_t, 2>, 18> kNuiCocoBones = {{
@@ -177,6 +334,216 @@ void CloseNuiSocket(NuiSocket* sock) {
   *sock = kInvalidNuiSocket;
 }
 
+float ClampDepthMeters(float depth_meters) {
+  const float min_depth =
+      std::max(float(cvars::nui_skeleton_min_depth_m), 0.1f);
+  const float max_depth =
+      std::max(float(cvars::nui_skeleton_max_depth_m), min_depth + 0.1f);
+  if (!std::isfinite(depth_meters) || depth_meters <= 0.0f) {
+    depth_meters = float(cvars::nui_skeleton_torso_baseline_z_m);
+  }
+  return std::clamp(depth_meters, min_depth, max_depth);
+}
+
+void SetVector(X_NUI_VECTOR4* vector, float x, float y, float z, float w) {
+  assert_not_null(vector);
+  vector->x = x;
+  vector->y = y;
+  vector->z = z;
+  vector->w = w;
+}
+
+NuiJointSample GetCocoJoint(const NuiDebugSnapshot& snapshot, uint32_t index,
+                            float confidence_threshold) {
+  NuiJointSample sample;
+  sample.z = ClampDepthMeters(float(cvars::nui_skeleton_torso_baseline_z_m));
+  if (index >= snapshot.joint_count) {
+    return sample;
+  }
+  const NuiJoint& joint = snapshot.joints[index];
+  sample.x = joint.x;
+  sample.y = joint.y;
+  sample.z = ClampDepthMeters(joint.z);
+  sample.confidence = joint.confidence;
+  sample.valid = joint.confidence >= confidence_threshold;
+  return sample;
+}
+
+NuiJointSample AverageJoints(const NuiJointSample& a, const NuiJointSample& b) {
+  NuiJointSample out;
+  out.x = (a.x + b.x) * 0.5f;
+  out.y = (a.y + b.y) * 0.5f;
+  out.z = (a.z + b.z) * 0.5f;
+  out.confidence = (a.confidence + b.confidence) * 0.5f;
+  out.valid = a.valid && b.valid;
+  return out;
+}
+
+void FillJoint(X_NUI_SKELETON_DATA* skeleton, NuiSkeletonPositionIndex index,
+               const NuiJointSample& sample) {
+  assert_not_null(skeleton);
+  SetVector(&skeleton->joints[index], sample.x, sample.y,
+            ClampDepthMeters(sample.z), 1.0f);
+  skeleton->joint_states[index] = sample.valid ? kNuiSkeletonPositionTracked
+                                               : kNuiSkeletonPositionNotTracked;
+}
+
+void BuildSkeletonFrame(const NuiDebugSnapshot& snapshot,
+                        X_NUI_SKELETON_FRAME* out_frame) {
+  assert_not_null(out_frame);
+  *out_frame = X_NUI_SKELETON_FRAME{};
+
+  out_frame->timestamp = snapshot.sensor_timestamp_us;
+  out_frame->frame_number = snapshot.frame_index;
+  out_frame->flags = snapshot.tracked ? 1u : 0u;
+  SetVector(&out_frame->floor_clip_plane, 0.0f, 1.0f, 0.0f, 0.0f);
+  SetVector(&out_frame->normal_to_gravity, 0.0f, 1.0f, 0.0f, 0.0f);
+
+  for (auto& skeleton : out_frame->skeletons) {
+    skeleton.tracking_state = kNuiSkeletonNotTracked;
+    skeleton.enrollment_index = 0xFFFFFFFFu;
+    skeleton.user_index = 0xFFFFFFFFu;
+  }
+
+  if (!snapshot.has_recent_frame || !snapshot.tracked || !snapshot.joint_count) {
+    return;
+  }
+
+  constexpr uint32_t kCocoNose = 0;
+  constexpr uint32_t kCocoLeftShoulder = 5;
+  constexpr uint32_t kCocoRightShoulder = 6;
+  constexpr uint32_t kCocoLeftElbow = 7;
+  constexpr uint32_t kCocoRightElbow = 8;
+  constexpr uint32_t kCocoLeftWrist = 9;
+  constexpr uint32_t kCocoRightWrist = 10;
+  constexpr uint32_t kCocoLeftHip = 11;
+  constexpr uint32_t kCocoRightHip = 12;
+  constexpr uint32_t kCocoLeftKnee = 13;
+  constexpr uint32_t kCocoRightKnee = 14;
+  constexpr uint32_t kCocoLeftAnkle = 15;
+  constexpr uint32_t kCocoRightAnkle = 16;
+
+  const float confidence_threshold =
+      float(cvars::nui_sensor_min_joint_confidence);
+  const NuiJointSample head =
+      GetCocoJoint(snapshot, kCocoNose, confidence_threshold);
+  const NuiJointSample shoulder_left =
+      GetCocoJoint(snapshot, kCocoLeftShoulder, confidence_threshold);
+  const NuiJointSample shoulder_right =
+      GetCocoJoint(snapshot, kCocoRightShoulder, confidence_threshold);
+  const NuiJointSample elbow_left =
+      GetCocoJoint(snapshot, kCocoLeftElbow, confidence_threshold);
+  const NuiJointSample elbow_right =
+      GetCocoJoint(snapshot, kCocoRightElbow, confidence_threshold);
+  const NuiJointSample wrist_left =
+      GetCocoJoint(snapshot, kCocoLeftWrist, confidence_threshold);
+  const NuiJointSample wrist_right =
+      GetCocoJoint(snapshot, kCocoRightWrist, confidence_threshold);
+  const NuiJointSample hip_left =
+      GetCocoJoint(snapshot, kCocoLeftHip, confidence_threshold);
+  const NuiJointSample hip_right =
+      GetCocoJoint(snapshot, kCocoRightHip, confidence_threshold);
+  const NuiJointSample knee_left =
+      GetCocoJoint(snapshot, kCocoLeftKnee, confidence_threshold);
+  const NuiJointSample knee_right =
+      GetCocoJoint(snapshot, kCocoRightKnee, confidence_threshold);
+  const NuiJointSample ankle_left =
+      GetCocoJoint(snapshot, kCocoLeftAnkle, confidence_threshold);
+  const NuiJointSample ankle_right =
+      GetCocoJoint(snapshot, kCocoRightAnkle, confidence_threshold);
+
+  const NuiJointSample shoulder_center =
+      AverageJoints(shoulder_left, shoulder_right);
+  const NuiJointSample hip_center = AverageJoints(hip_left, hip_right);
+  const NuiJointSample spine = AverageJoints(hip_center, shoulder_center);
+
+  NuiJointSample safe_hip_center = hip_center;
+  if (!safe_hip_center.valid) {
+    safe_hip_center.x = 0.0f;
+    safe_hip_center.y = 0.0f;
+    safe_hip_center.z =
+        ClampDepthMeters(float(cvars::nui_skeleton_torso_baseline_z_m));
+    safe_hip_center.valid = true;
+  }
+  NuiJointSample safe_head = head;
+  if (!safe_head.valid) {
+    safe_head.x = safe_hip_center.x;
+    safe_head.y = safe_hip_center.y - 0.35f;
+    safe_head.z = safe_hip_center.z - 0.08f;
+    safe_head.valid = true;
+  }
+  NuiJointSample safe_hip_left = hip_left;
+  if (!safe_hip_left.valid) {
+    safe_hip_left.x = safe_hip_center.x - 0.10f;
+    safe_hip_left.y = safe_hip_center.y;
+    safe_hip_left.z = safe_hip_center.z + 0.05f;
+    safe_hip_left.valid = true;
+  }
+  NuiJointSample safe_hip_right = hip_right;
+  if (!safe_hip_right.valid) {
+    safe_hip_right.x = safe_hip_center.x + 0.10f;
+    safe_hip_right.y = safe_hip_center.y;
+    safe_hip_right.z = safe_hip_center.z + 0.05f;
+    safe_hip_right.valid = true;
+  }
+  NuiJointSample safe_hand_left = wrist_left;
+  if (!safe_hand_left.valid) {
+    safe_hand_left.x = safe_hip_center.x - 0.20f;
+    safe_hand_left.y = safe_hip_center.y + 0.10f;
+    safe_hand_left.z = safe_hip_center.z - 0.25f;
+    safe_hand_left.valid = true;
+  }
+  NuiJointSample safe_hand_right = wrist_right;
+  if (!safe_hand_right.valid) {
+    safe_hand_right.x = safe_hip_center.x + 0.20f;
+    safe_hand_right.y = safe_hip_center.y + 0.10f;
+    safe_hand_right.z = safe_hip_center.z - 0.25f;
+    safe_hand_right.valid = true;
+  }
+
+  X_NUI_SKELETON_DATA& skeleton = out_frame->skeletons[0];
+  skeleton.tracking_state = kNuiSkeletonTracked;
+  skeleton.tracking_id = 1;
+  skeleton.enrollment_index = 0;
+  skeleton.user_index = 0;
+
+  SetVector(&skeleton.position, safe_hip_center.x, safe_hip_center.y,
+            safe_hip_center.z, 1.0f);
+  FillJoint(&skeleton, kNuiSkeletonPositionHipCenter, safe_hip_center);
+  FillJoint(&skeleton, kNuiSkeletonPositionSpine, spine);
+  FillJoint(&skeleton, kNuiSkeletonPositionShoulderCenter, shoulder_center);
+  FillJoint(&skeleton, kNuiSkeletonPositionHead, safe_head);
+  FillJoint(&skeleton, kNuiSkeletonPositionShoulderLeft, shoulder_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionElbowLeft, elbow_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionWristLeft, wrist_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionHandLeft, safe_hand_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionShoulderRight, shoulder_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionElbowRight, elbow_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionWristRight, wrist_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionHandRight, safe_hand_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionHipLeft, safe_hip_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionKneeLeft, knee_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionAnkleLeft, ankle_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionFootLeft, ankle_left);
+  FillJoint(&skeleton, kNuiSkeletonPositionHipRight, safe_hip_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionKneeRight, knee_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionAnkleRight, ankle_right);
+  FillJoint(&skeleton, kNuiSkeletonPositionFootRight, ankle_right);
+  // Keep core joints tracked so retail title gating logic sees a stable body.
+  skeleton.joint_states[kNuiSkeletonPositionHead] = kNuiSkeletonPositionTracked;
+  skeleton.joint_states[kNuiSkeletonPositionHipCenter] =
+      kNuiSkeletonPositionTracked;
+  skeleton.joint_states[kNuiSkeletonPositionHipLeft] =
+      kNuiSkeletonPositionTracked;
+  skeleton.joint_states[kNuiSkeletonPositionHipRight] =
+      kNuiSkeletonPositionTracked;
+  skeleton.joint_states[kNuiSkeletonPositionHandLeft] =
+      kNuiSkeletonPositionTracked;
+  skeleton.joint_states[kNuiSkeletonPositionHandRight] =
+      kNuiSkeletonPositionTracked;
+  skeleton.tracking_state = kNuiSkeletonTracked;
+}
+
 class NuiUdpSensorService {
  public:
   static NuiUdpSensorService& Get() {
@@ -187,10 +554,10 @@ class NuiUdpSensorService {
   ~NuiUdpSensorService() { Shutdown(); }
 
   void EnsureRunning() {
+    EnsureDebugOverlayRegistered();
     if (!cvars::nui_sensor_udp_enabled) {
       return;
     }
-    EnsureDebugOverlayRegistered();
     bool expected = false;
     if (!started_.compare_exchange_strong(expected, true)) {
       return;
@@ -232,6 +599,8 @@ class NuiUdpSensorService {
     snapshot.host_receive_us =
         last_frame_host_us_.load(std::memory_order_relaxed);
     snapshot.receive_fps = receive_fps_.load(std::memory_order_relaxed);
+    snapshot.frame_width = last_frame_width_.load(std::memory_order_relaxed);
+    snapshot.frame_height = last_frame_height_.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(frame_mutex_);
     snapshot.joint_count = latest_joint_count_;
     if (snapshot.joint_count) {
@@ -243,7 +612,8 @@ class NuiUdpSensorService {
 
  private:
   void EnsureDebugOverlayRegistered() {
-    if (!cvars::show_kinect_debug || cvars::headless) {
+    if ((!cvars::show_kinect_debug && !cvars::show_kinect_nui_log) ||
+        cvars::headless) {
       return;
     }
 
@@ -273,7 +643,7 @@ class NuiUdpSensorService {
         [this, imgui_drawer]() {
           imgui_drawer->AddDrawCallback(this, [this,
                                                imgui_drawer](ImGuiIO& io) {
-            if (!cvars::show_kinect_debug) {
+            if (!cvars::show_kinect_debug && !cvars::show_kinect_nui_log) {
               imgui_drawer->RemoveDrawCallback(this);
               debug_overlay_registered_.store(false, std::memory_order_relaxed);
               return;
@@ -287,7 +657,7 @@ class NuiUdpSensorService {
   }
 
   void DrawDebugOverlay(ImGuiIO& io) {
-    if (!cvars::show_kinect_debug) {
+    if (!cvars::show_kinect_debug && !cvars::show_kinect_nui_log) {
       return;
     }
 
@@ -305,21 +675,59 @@ class NuiUdpSensorService {
       latency_ms = float(now_us - snapshot.sensor_timestamp_us) / 1000.0f;
     }
 
-    ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.60f);
-    ImGui::Begin(
-        "Kinect Debug Overlay", nullptr,
-        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-    ImGui::Text("sensor=%s tracked=%s",
-                snapshot.has_recent_frame ? "ready" : "no-frame",
-                snapshot.tracked ? "yes" : "no");
-    ImGui::Text("frame=%u joints=%u", snapshot.frame_index,
-                uint32_t(snapshot.joint_count));
-    ImGui::Text("rx_fps=%.1f", snapshot.receive_fps);
-    ImGui::Text("latency=%.1f ms age=%.1f ms", latency_ms, age_ms);
-    ImGui::End();
+    if (cvars::show_kinect_debug) {
+      ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_Always);
+      ImGui::SetNextWindowBgAlpha(0.60f);
+      ImGui::Begin(
+          "Kinect Debug Overlay", nullptr,
+          ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+              ImGuiWindowFlags_NoSavedSettings |
+              ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+      ImGui::Text("sensor=%s tracked=%s",
+                  snapshot.has_recent_frame ? "ready" : "no-frame",
+                  snapshot.tracked ? "yes" : "no");
+      ImGui::Text("frame=%u joints=%u", snapshot.frame_index,
+                  uint32_t(snapshot.joint_count));
+      ImGui::Text("rx_fps=%.1f", snapshot.receive_fps);
+      ImGui::Text("latency=%.1f ms age=%.1f ms", latency_ms, age_ms);
+      if (snapshot.frame_width && snapshot.frame_height) {
+        ImGui::Text("source=%ux%u", uint32_t(snapshot.frame_width),
+                    uint32_t(snapshot.frame_height));
+      } else {
+        ImGui::Text("source=unknown");
+      }
+      ImGui::End();
+    }
+
+    if (cvars::show_kinect_nui_log) {
+      ImGui::SetNextWindowPos(ImVec2(12.0f, 108.0f), ImGuiCond_FirstUseEver);
+      ImGui::SetNextWindowSize(ImVec2(760.0f, 340.0f), ImGuiCond_FirstUseEver);
+      ImGui::SetNextWindowBgAlpha(0.65f);
+      if (ImGui::Begin("Kinect NUI Call Log", nullptr)) {
+        if (ImGui::Button("Clear")) {
+          std::lock_guard<std::mutex> lock(g_nui_log_mutex);
+          g_nui_log_lines.clear();
+        }
+        ImGui::SameLine();
+        ImGui::Text("entries=%llu",
+                    static_cast<unsigned long long>(
+                        g_nui_log_line_index.load(std::memory_order_relaxed)));
+        ImGui::Separator();
+        ImGui::BeginChild("kinect_nui_log_scroll", ImVec2(0.0f, 0.0f), false,
+                          ImGuiWindowFlags_HorizontalScrollbar);
+        const auto lines = CopyNuiLogLines();
+        for (const std::string& line : lines) {
+          ImGui::TextUnformatted(line.c_str());
+        }
+        ImGui::SetScrollHereY(1.0f);
+        ImGui::EndChild();
+      }
+      ImGui::End();
+    }
+
+    if (!cvars::show_kinect_debug) {
+      return;
+    }
 
     if (!snapshot.has_recent_frame || !snapshot.joint_count ||
         !(io.DisplaySize.x > 0.0f) || !(io.DisplaySize.y > 0.0f)) {
@@ -328,6 +736,27 @@ class NuiUdpSensorService {
 
     const float display_width = io.DisplaySize.x;
     const float display_height = io.DisplaySize.y;
+    float source_aspect = 0.0f;
+    if (snapshot.frame_width && snapshot.frame_height) {
+      source_aspect =
+          float(snapshot.frame_width) / float(snapshot.frame_height);
+    }
+    if (!(source_aspect > 0.0f)) {
+      source_aspect = std::max(float(cvars::nui_sensor_source_aspect_ratio),
+                               0.1f);
+    }
+    const float display_aspect = display_width / display_height;
+    float content_x = 0.0f;
+    float content_y = 0.0f;
+    float content_width = display_width;
+    float content_height = display_height;
+    if (display_aspect > source_aspect) {
+      content_width = display_height * source_aspect;
+      content_x = (display_width - content_width) * 0.5f;
+    } else {
+      content_height = display_width / source_aspect;
+      content_y = (display_height - content_height) * 0.5f;
+    }
     const float confidence_threshold =
         float(cvars::nui_sensor_min_joint_confidence);
     ImDrawList* draw_list = ImGui::GetForegroundDrawList();
@@ -335,15 +764,15 @@ class NuiUdpSensorService {
       return;
     }
 
-    auto joint_to_screen = [display_width,
-                            display_height](const NuiJoint& joint) -> ImVec2 {
+    auto joint_to_screen = [content_x, content_y, content_width,
+                            content_height](const NuiJoint& joint) -> ImVec2 {
       // Sender currently emits normalized camera coordinates in [-1, 1].
       bool is_unit = joint.x >= 0.0f && joint.x <= 1.0f && joint.y >= 0.0f &&
                      joint.y <= 1.0f;
-      float x = is_unit ? (joint.x * display_width)
-                        : ((joint.x * 0.5f + 0.5f) * display_width);
-      float y = is_unit ? (joint.y * display_height)
-                        : ((0.5f - joint.y * 0.5f) * display_height);
+      float x_norm = is_unit ? joint.x : (joint.x * 0.5f + 0.5f);
+      float y_norm = is_unit ? joint.y : (0.5f - joint.y * 0.5f);
+      float x = content_x + x_norm * content_width;
+      float y = content_y + y_norm * content_height;
       return ImVec2(x, y);
     };
 
@@ -402,10 +831,12 @@ class NuiUdpSensorService {
 
   void WorkerMain() {
     xe::threading::set_name("xam_nui_sensor");
+    AddNuiLogLine("NUI UDP sensor worker started");
 
     NuiSocket sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock == kInvalidNuiSocket) {
       XELOGE("NUI sensor: failed to create UDP socket");
+      AddNuiLogLine("Failed to create NUI UDP socket");
       return;
     }
 
@@ -419,11 +850,14 @@ class NuiUdpSensorService {
              sizeof(bind_addr)) != 0) {
       XELOGE("NUI sensor: failed to bind UDP port {}",
              cvars::nui_sensor_udp_port);
+      LogNui("Failed to bind NUI UDP port {}", cvars::nui_sensor_udp_port);
       CloseNuiSocket(&sock);
       return;
     }
 
     XELOGI("NUI sensor: listening on 127.0.0.1:{}", cvars::nui_sensor_udp_port);
+    LogNui("Listening for RTMPose UDP frames at 127.0.0.1:{}",
+           cvars::nui_sensor_udp_port);
 
     std::array<uint8_t, 4096> packet = {};
     while (!stop_requested_.load(std::memory_order_relaxed)) {
@@ -459,6 +893,7 @@ class NuiUdpSensorService {
     }
 
     CloseNuiSocket(&sock);
+    AddNuiLogLine("NUI UDP sensor worker stopped");
   }
 
   void ParseFrame(const uint8_t* data, size_t size) {
@@ -482,12 +917,20 @@ class NuiUdpSensorService {
     if (size < expected_size) {
       return;
     }
+    uint16_t frame_width = 0;
+    uint16_t frame_height = 0;
+    if (size >= expected_size + kNuiUdpFrameSizeTailSize) {
+      frame_width = ReadLE16(data + expected_size + 0);
+      frame_height = ReadLE16(data + expected_size + 2);
+    }
 
     const size_t capped_joint_count =
         std::min(size_t(joint_count), kNuiMaxJoints);
     std::array<NuiJoint, kNuiMaxJoints> joints = {};
 
     bool tracked = tracked_flag != 0;
+    const float depth_smoothing =
+        std::clamp(float(cvars::nui_skeleton_depth_smoothing), 0.0f, 1.0f);
     for (size_t i = 0; i < capped_joint_count; ++i) {
       const uint8_t* joint_ptr =
           data + kNuiUdpHeaderSize + i * kNuiUdpJointSize;
@@ -496,12 +939,21 @@ class NuiUdpSensorService {
       joint.y = ReadLEFloat(joint_ptr + 4);
       joint.z = ReadLEFloat(joint_ptr + 8);
       joint.confidence = ReadLEFloat(joint_ptr + 12);
+      joint.z = ClampDepthMeters(joint.z);
+      if (depth_initialized_[i]) {
+        joint.z =
+            smoothed_depths_[i] * (1.0f - depth_smoothing) +
+            joint.z * depth_smoothing;
+      }
+      smoothed_depths_[i] = joint.z;
+      depth_initialized_[i] = true;
       joints[i] = joint;
       if (!tracked &&
           joint.confidence >= float(cvars::nui_sensor_min_joint_confidence)) {
         tracked = true;
       }
     }
+    const bool previous_tracked = tracked_.load(std::memory_order_relaxed);
 
     const uint64_t host_receive_us = QuerySteadyMicros();
     const uint64_t previous_host_us =
@@ -531,6 +983,21 @@ class NuiUdpSensorService {
     last_sensor_timestamp_us_.store(sensor_timestamp_us,
                                     std::memory_order_relaxed);
     last_frame_host_us_.store(host_receive_us, std::memory_order_relaxed);
+    last_frame_width_.store(frame_width, std::memory_order_relaxed);
+    last_frame_height_.store(frame_height, std::memory_order_relaxed);
+
+    const int log_interval = std::max(cvars::nui_sensor_log_frame_interval, 0);
+    if (log_interval &&
+        ((frame_index % uint32_t(log_interval)) == 0 || tracked != previous_tracked)) {
+      const NuiJoint nose = capped_joint_count > 0 ? joints[0] : NuiJoint{};
+      const NuiJoint hip_left = capped_joint_count > 11 ? joints[11] : NuiJoint{};
+      const NuiJoint hip_right = capped_joint_count > 12 ? joints[12] : NuiJoint{};
+      LogNui(
+          "RX frame={} tracked={} joints={} src={}x{} nose=({:.3f},{:.3f},{:.3f}|{:.2f}) hips=({:.3f},{:.3f})/({:.3f},{:.3f})",
+          frame_index, tracked ? "yes" : "no", uint32_t(capped_joint_count),
+          uint32_t(frame_width), uint32_t(frame_height), nose.x, nose.y, nose.z,
+          nose.confidence, hip_left.x, hip_left.y, hip_right.x, hip_right.y);
+    }
   }
 
   std::thread worker_;
@@ -541,10 +1008,14 @@ class NuiUdpSensorService {
   std::atomic<uint32_t> last_frame_index_ = 0;
   std::atomic<uint64_t> last_sensor_timestamp_us_ = 0;
   std::atomic<uint64_t> last_frame_host_us_ = 0;
+  std::atomic<uint16_t> last_frame_width_ = 0;
+  std::atomic<uint16_t> last_frame_height_ = 0;
   std::atomic<float> receive_fps_ = 0.0f;
   mutable std::mutex frame_mutex_;
   uint16_t latest_joint_count_ = 0;
   std::array<NuiJoint, kNuiMaxJoints> latest_joints_ = {};
+  std::array<float, kNuiMaxJoints> smoothed_depths_ = {};
+  std::array<bool, kNuiMaxJoints> depth_initialized_ = {};
 };
 
 bool IsNuiDeviceConnected() {
@@ -576,9 +1047,12 @@ uint64_t nui_session_id = 0;
 
 uint32_t XeXamNuiHudCheck(dword_t tracking_id) {
   if (!IsNuiDeviceConnected()) {
+    LogNui("XeXamNuiHudCheck({:08X}) -> access denied",
+           uint32_t(tracking_id));
     return X_ERROR_ACCESS_DENIED;
   }
   engaged_tracking_id = tracking_id;
+  LogNui("XeXamNuiHudCheck({:08X}) -> success", uint32_t(tracking_id));
   return X_ERROR_SUCCESS;
 }
 
@@ -587,28 +1061,38 @@ uint32_t XeXamNuiHudCheck(dword_t tracking_id) {
 dword_result_t XamNuiGetDeviceStatus_entry(
     pointer_t<X_NUI_DEVICE_STATUS> status_ptr) {
   if (!status_ptr) {
+    AddNuiLogLine("XamNuiGetDeviceStatus(status_ptr=null)");
     return X_E_INVALIDARG;
   }
   const bool connected = IsNuiDeviceConnected();
   status_ptr.Zero();
   status_ptr->status = connected ? 1u : 0u;
+  LogNui("XamNuiGetDeviceStatus(status_ptr={:08X}) -> connected={}",
+         status_ptr.guest_address(), connected ? "yes" : "no");
   return connected ? X_ERROR_SUCCESS : 0xC0050006;
 }
 DECLARE_XAM_EXPORT1(XamNuiGetDeviceStatus, kNone, kStub);
 
 dword_result_t XamUserNuiGetUserIndex_entry(unknown_t unk, lpdword_t index) {
+  LogNui("XamUserNuiGetUserIndex(unk={:08X}, index_ptr={:08X}) -> no user",
+         uint32_t(unk), index.guest_address());
   return X_E_NO_SUCH_USER;
 }
 DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndex, kNone, kStub);
 
 dword_result_t XamUserNuiGetUserIndexForSignin_entry(lpdword_t index) {
   if (!index) {
+    AddNuiLogLine("XamUserNuiGetUserIndexForSignin(index_ptr=null)");
     return X_E_INVALIDARG;
   }
   if (kernel_state()->user_profile()->signin_state()) {
     *index = 0;
+    LogNui("XamUserNuiGetUserIndexForSignin(index_ptr={:08X}) -> 0",
+           index.guest_address());
     return X_E_SUCCESS;
   }
+  LogNui("XamUserNuiGetUserIndexForSignin(index_ptr={:08X}) -> denied",
+         index.guest_address());
   return X_HRESULT_FROM_WIN32(X_ERROR_ACCESS_DENIED);
 }
 DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndexForSignin, kNone, kImplemented);
@@ -619,14 +1103,84 @@ dword_result_t XamUserNuiGetUserIndexForBind_entry(lpdword_t index) {
 DECLARE_XAM_EXPORT1(XamUserNuiGetUserIndexForBind, kNone, kStub);
 
 dword_result_t XamNuiGetDepthCalibration_entry(lpdword_t unk1) {
+  LogNui("XamNuiGetDepthCalibration(ptr={:08X}) -> not found",
+         unk1.guest_address());
   return X_STATUS_NO_SUCH_FILE;
 }
 DECLARE_XAM_EXPORT1(XamNuiGetDepthCalibration, kNone, kStub);
 
 qword_result_t XamNuiSkeletonGetBestSkeletonIndex_entry(int_t unk) {
-  return IsNuiSkeletonTracked() ? 0ull : 0xFFFFFFFFFFFFFFFFull;
+  const bool tracked = IsNuiSkeletonTracked();
+  LogNui("XamNuiSkeletonGetBestSkeletonIndex(unk={:08X}) -> {}",
+         uint32_t(unk), tracked ? "0" : "FFFFFFFFFFFFFFFF");
+  return tracked ? 0ull : 0xFFFFFFFFFFFFFFFFull;
 }
 DECLARE_XAM_EXPORT1(XamNuiSkeletonGetBestSkeletonIndex, kNone, kImplemented);
+
+dword_result_t XamNuiSkeletonScoreUpdate_entry(
+    unknown_t arg0, unknown_t arg1, unknown_t arg2, unknown_t arg3,
+    unknown_t arg4, unknown_t arg5, unknown_t arg6, unknown_t arg7) {
+  const std::array<uint32_t, 8> args = {
+      uint32_t(arg0), uint32_t(arg1), uint32_t(arg2), uint32_t(arg3),
+      uint32_t(arg4), uint32_t(arg5), uint32_t(arg6), uint32_t(arg7),
+  };
+  LogNui(
+      "XamNuiSkeletonScoreUpdate(args=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}])",
+      args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7]);
+
+  int output_arg_index =
+      std::clamp(cvars::nui_skeleton_score_output_arg_index, -1, 7);
+  if (output_arg_index < 0) {
+    AddNuiLogLine(
+        "XamNuiSkeletonScoreUpdate output disabled by cvar "
+        "nui_skeleton_score_output_arg_index");
+    return X_ERROR_SUCCESS;
+  }
+
+  uint32_t output_ptr = args[size_t(output_arg_index)];
+  if (!IsLikelyGuestAddress(output_ptr)) {
+    for (size_t i = 0; i < args.size(); ++i) {
+      if (!IsLikelyGuestAddress(args[i])) {
+        continue;
+      }
+      output_arg_index = int(i);
+      output_ptr = args[i];
+      break;
+    }
+  }
+  if (!IsLikelyGuestAddress(output_ptr)) {
+    LogNui("XamNuiSkeletonScoreUpdate: no plausible output pointer found");
+    return X_ERROR_SUCCESS;
+  }
+
+  auto* out_frame = kernel_memory()->TranslateVirtual<X_NUI_SKELETON_FRAME*>(
+      output_ptr);
+  if (!out_frame) {
+    LogNui("XamNuiSkeletonScoreUpdate: output pointer {:08X} is not mapped",
+           output_ptr);
+    return X_ERROR_SUCCESS;
+  }
+  NuiUdpSensorService& sensor = NuiUdpSensorService::Get();
+  sensor.EnsureRunning();
+  const NuiDebugSnapshot snapshot = sensor.GetDebugSnapshot();
+  BuildSkeletonFrame(snapshot, out_frame);
+  if (engaged_tracking_id) {
+    out_frame->skeletons[0].tracking_id = engaged_tracking_id;
+  }
+
+  const auto& skel = out_frame->skeletons[0];
+  const auto& head = skel.joints[kNuiSkeletonPositionHead];
+  const auto& hip = skel.joints[kNuiSkeletonPositionHipCenter];
+  LogNui(
+      "XamNuiSkeletonScoreUpdate wrote arg{}={:08X}: tracked={} frame={} tracking_id={} head=({:.3f},{:.3f},{:.3f}) hip=({:.3f},{:.3f},{:.3f})",
+      output_arg_index, output_ptr, uint32_t(skel.tracking_state),
+      uint32_t(out_frame->frame_number),
+      uint32_t(skel.tracking_id), float(head.x), float(head.y), float(head.z),
+      float(hip.x), float(hip.y), float(hip.z));
+
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamNuiSkeletonScoreUpdate, kNone, kImplemented);
 
 dword_result_t XamNuiCameraTiltGetStatus_entry(lpvoid_t unk) {
   return IsNuiDeviceConnected() ? X_ERROR_SUCCESS : X_E_DEVICE_NOT_CONNECTED;
@@ -658,7 +1212,11 @@ DECLARE_XAM_EXPORT1(XamNuiCameraSetFlags, kNone, kStub);
 dword_result_t XamIsNuiUIActive_entry() { return xam_dialogs_shown_ > 0; }
 DECLARE_XAM_EXPORT1(XamIsNuiUIActive, kNone, kImplemented);
 
-dword_result_t XamNuiIsDeviceReady_entry() { return IsNuiDeviceConnected(); }
+dword_result_t XamNuiIsDeviceReady_entry() {
+  const bool connected = IsNuiDeviceConnected();
+  LogNui("XamNuiIsDeviceReady() -> {}", connected ? "1" : "0");
+  return connected;
+}
 DECLARE_XAM_EXPORT1(XamNuiIsDeviceReady, kNone, kImplemented);
 
 dword_result_t XamIsNuiAutomationEnabled_entry(unknown_t unk1, unknown_t unk2) {
@@ -676,11 +1234,13 @@ DECLARE_XAM_EXPORT1(XamNuiIsChatMicEnabled, kNone, kImplemented);
 
 dword_result_t XamNuiHudSetEngagedTrackingID_entry(dword_t tracking_id) {
   engaged_tracking_id = tracking_id;
+  LogNui("XamNuiHudSetEngagedTrackingID({:08X})", uint32_t(tracking_id));
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamNuiHudSetEngagedTrackingID, kNone, kImplemented);
 
 qword_result_t XamNuiHudGetEngagedTrackingID_entry() {
+  LogNui("XamNuiHudGetEngagedTrackingID() -> {:08X}", engaged_tracking_id);
   return engaged_tracking_id;
 }
 DECLARE_XAM_EXPORT1(XamNuiHudGetEngagedTrackingID, kNone, kImplemented);
@@ -703,6 +1263,8 @@ DECLARE_XAM_EXPORT1(XamNuiHudGetVersions, kNone, kImplemented);
 
 dword_result_t XamShowNuiTroubleshooterUI_entry(unknown_t unk1, unknown_t unk2,
                                                 unknown_t unk3) {
+  LogNui("XamShowNuiTroubleshooterUI({:08X}, {:08X}, {:08X})", uint32_t(unk1),
+         uint32_t(unk2), uint32_t(unk3));
   if (cvars::headless) {
     return X_ERROR_SUCCESS;
   }
